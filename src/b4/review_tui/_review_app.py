@@ -12,6 +12,7 @@ import re
 import subprocess
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+import liblore.utils
 from rich.rule import Rule
 from rich.syntax import Syntax
 from rich.text import Text
@@ -48,7 +49,6 @@ from b4.review_tui._common import (
     _write_followup_trailers,
     compute_range_diff,
     filter_range_diff_for_commit,
-    get_thread_msgs,
     logger,
     mark_outgoing_seen,
     notify_quit_hint,
@@ -312,6 +312,7 @@ class ReviewApp(LoreNodeShutdownMixin, CheckRunnerMixin, App[None]):
         self._followup_header_map: Dict[int, Dict[str, Any]] = {}
         self._selected_followup_msgid: Optional[str] = None
         self._show_external_comments: bool = False
+        self._followup_generation: int = 0
         self._collapsed_comment_lines: Dict[int, Tuple[str, int]] = {}
         self._reply_sent: bool = False
         self._hide_skipped: bool = False
@@ -2101,6 +2102,7 @@ class ReviewApp(LoreNodeShutdownMixin, CheckRunnerMixin, App[None]):
 
     def action_followups(self) -> None:
         """Toggle follow-up comments on/off."""
+        self._followup_generation += 1
         # ── Toggle off ────────────────────────────────────────────────────────
         if self._show_external_comments:
             self._show_external_comments = False
@@ -2117,52 +2119,90 @@ class ReviewApp(LoreNodeShutdownMixin, CheckRunnerMixin, App[None]):
 
         self._show_external_comments = True
 
-        # ── Try local blob first, fall back to lore in background ────────────
         blob_sha = self._series.get('thread-blob', '')
+        generation = self._followup_generation
         self.notify('Loading follow-ups\u2026')
         run_lore_worker(
             self,
-            lambda: self._fetch_followups_bg(cover_msgid, blob_sha),
+            lambda: self._fetch_followups_bg(cover_msgid, blob_sha, generation),
             name='_followup_worker',
         )
 
-    def _fetch_rethreaded_threads(
+    def _fetch_lore_followups(
+        self, msgid: str
+    ) -> Optional[List[email.message.EmailMessage]]:
+        """Fetch a fresh thread, leaving the snapshot available on failure."""
+        try:
+            return b4.get_pi_thread_by_msgid(msgid, nocache=True, quiet=True) or None
+        except liblore.OperationCancelledError:
+            raise
+        except Exception as ex:
+            logger.debug('follow-up refresh failed: %s', ex, exc_info=True)
+            return None
+
+    def _read_followup_blob(
         self, blob_sha: str
     ) -> Optional[List[email.message.EmailMessage]]:
+        """Read a saved thread without falling back to another Lore request."""
+        if blob_sha:
+            mbox_bytes = b4.review.tracking.get_thread_mbox(self._topdir, blob_sha)
+            if mbox_bytes is not None and mbox_bytes:
+                return liblore.utils.split_mbox(mbox_bytes) or None
+        return None
+
+    def _fetch_rethreaded_threads(
+        self, blob_sha: str
+    ) -> Tuple[Optional[List[email.message.EmailMessage]], bool, bool]:
         """Fetch threads for each real patch in a rethreaded series."""
         all_msgs: List[email.message.EmailMessage] = []
         seen_msgids: Set[str] = set()
         fetched_patches: Set[str] = set()
+        fetched_from_lore = False
+        needs_snapshot = False
         for patch_meta in self._patches:
-            # One lore fetch per patch; bail promptly on cancel/exit.
             if worker_cancelled():
-                break
+                return None, False, False
             pmsgid = patch_meta.get('header-info', {}).get('msgid', '')
             if not pmsgid or pmsgid in fetched_patches:
                 continue
             fetched_patches.add(pmsgid)
-            thread = get_thread_msgs(
-                self._topdir, pmsgid, blob_sha=blob_sha, quiet=True
-            )
-            if thread:
+            thread = self._fetch_lore_followups(pmsgid)
+            if thread is not None:
+                fetched_from_lore = True
                 for msg in thread:
                     c_msgid = b4.LoreMessage.get_clean_msgid(msg)
-                    if c_msgid and c_msgid not in seen_msgids:
+                    if c_msgid is not None and c_msgid and c_msgid not in seen_msgids:
                         all_msgs.append(msg)
                         seen_msgids.add(c_msgid)
-        return all_msgs or None
+            else:
+                needs_snapshot = True
+        needs_snapshot = needs_snapshot or not fetched_patches
+        if needs_snapshot:
+            for msg in self._read_followup_blob(blob_sha) or []:
+                c_msgid = b4.LoreMessage.get_clean_msgid(msg)
+                if c_msgid is not None and c_msgid and c_msgid not in seen_msgids:
+                    all_msgs.append(msg)
+                    seen_msgids.add(c_msgid)
+        return all_msgs or None, fetched_from_lore, needs_snapshot
 
-    def _fetch_followups_bg(self, cover_msgid: str, blob_sha: str) -> None:
-        """Load follow-ups from local blob or lore (background thread)."""
+    def _fetch_followups_bg(
+        self, cover_msgid: str, blob_sha: str, generation: int
+    ) -> None:
+        """Refresh follow-ups from Lore, falling back to the local snapshot."""
+        fetched_from_lore = False
+        refresh_incomplete = False
         try:
             with _quiet_worker():
                 if self._series.get('is-rethreaded'):
-                    # Rethreaded series: fetch each real patch's thread
-                    msgs = self._fetch_rethreaded_threads(blob_sha)
-                else:
-                    msgs = get_thread_msgs(
-                        self._topdir, cover_msgid, blob_sha=blob_sha, quiet=True
+                    msgs, fetched_from_lore, refresh_incomplete = (
+                        self._fetch_rethreaded_threads(blob_sha)
                     )
+                else:
+                    msgs = self._fetch_lore_followups(cover_msgid)
+                    fetched_from_lore = msgs is not None
+                    if msgs is None:
+                        refresh_incomplete = True
+                        msgs = self._read_followup_blob(blob_sha)
         except liblore.OperationCancelledError:
             # The fetch was cancelled (app shutdown or navigating away).
             # Leave the UI as-is rather than surfacing a spurious error.
@@ -2175,9 +2215,14 @@ class ReviewApp(LoreNodeShutdownMixin, CheckRunnerMixin, App[None]):
             logger.debug('follow-up fetch failed: %s', ex, exc_info=True)
             msgs = None
 
-        if not msgs:
+        if worker_cancelled() or generation != self._followup_generation:
+            return
+
+        if msgs is None:
 
             def _no_msgs() -> None:
+                if generation != self._followup_generation:
+                    return
                 self.notify('Could not load thread', severity='error')
                 # Still refresh to show external comments (sashiko etc.)
                 self._populate_patch_list()
@@ -2186,19 +2231,37 @@ class ReviewApp(LoreNodeShutdownMixin, CheckRunnerMixin, App[None]):
             self.app.call_from_thread(_no_msgs)
             return
 
-        # Cache the thread locally if we fetched from lore.
-        if not blob_sha:
-            change_id = self._series.get('change-id')
-            if change_id:
-                with _quiet_worker():
-                    new_sha = b4.review.tracking._store_thread_blob(
-                        self._topdir, change_id, msgs
-                    )
-                if new_sha:
-                    self._series['thread-blob'] = new_sha
-
         def _finish() -> None:
+            if generation != self._followup_generation:
+                return
+            if fetched_from_lore:
+                change_id = self._series.get('change-id')
+                if change_id:
+                    try:
+                        with _quiet_worker():
+                            new_sha = b4.review.tracking._store_thread_blob(
+                                self._topdir, change_id, msgs
+                            )
+                            if new_sha is not None and new_sha:
+                                self._series['thread-blob'] = new_sha
+                                _cover, tracking = b4.review.load_tracking(
+                                    self._topdir, self._branch
+                                )
+                                context_sha = tracking.get('series', {}).get(
+                                    'thread-context-blob'
+                                )
+                                if context_sha:
+                                    self._series['thread-context-blob'] = context_sha
+                    except (Exception, SystemExit) as ex:
+                        logger.debug(
+                            'Could not save follow-up thread: %s', ex, exc_info=True
+                        )
             self._load_followup_msgs(msgs)
+            if refresh_incomplete:
+                self.notify(
+                    'Lore refresh incomplete; follow-ups may be missing or out of date',
+                    severity='warning',
+                )
             self._mark_followup_msgs_seen(msgs)
             self._detect_maintainer_replies(msgs)
 
