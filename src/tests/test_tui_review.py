@@ -29,6 +29,7 @@ import b4.review.tracking
 from b4.review_tui._common import filter_range_diff_for_commit
 from b4.review_tui._review_app import FollowupItem, PatchListItem, ReviewApp
 
+from .helpers.mail import MINIMAL_DIFF, make_msg
 from .helpers.tracking import create_review_branch
 from .helpers.tui import CUT_BUFFER, CUT_INSTRUCTION, CUT_TRIMMED
 
@@ -371,6 +372,392 @@ class TestFollowupSelection:
             with mock.patch.object(app, '_compose_followup_reply') as compose:
                 app.action_edit_reply()
             compose.assert_called_once_with(entries[1])
+
+
+class TestFollowupTree:
+    def test_tree_keeps_orphans_and_breaks_cycles(self, gitdir: str) -> None:
+        branch, _shas = _create_review_branch_with_patches(
+            gitdir, 'followup-tree-cycles', ['patch 1']
+        )
+        app = ReviewApp(_build_session(gitdir, branch))
+        entries = [
+            {'msgid': 'cycle-a', 'lmsg': mock.Mock(in_reply_to='cycle-b')},
+            {'msgid': 'cycle-b', 'lmsg': mock.Mock(in_reply_to='cycle-a')},
+            {'msgid': 'orphan', 'lmsg': mock.Mock(in_reply_to='missing')},
+            {'msgid': 'self', 'lmsg': mock.Mock(in_reply_to='self')},
+        ]
+        ordered = app._thread_followups(entries)
+        assert [(entry['msgid'], depth) for entry, depth in ordered] == [
+            ('orphan', 0),
+            ('self', 0),
+            ('cycle-a', 0),
+            ('cycle-b', 1),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_tree_groups_replies_and_preserves_reply_target(
+        self, gitdir: str
+    ) -> None:
+        branch, _shas = _create_review_branch_with_patches(
+            gitdir,
+            'followup-tree',
+            ['patch 1'],
+            series_extra={'header-info': {'msgid': 'cover@example.com'}},
+        )
+        app = ReviewApp(_build_session(gitdir, branch))
+        messages = [
+            make_msg('cover@example.com', '[PATCH 0/1] Test series'),
+            make_msg(
+                'bernhard@example.com',
+                'Re: [PATCH 0/1] Test series',
+                from_addr='Bernhard <bernhard@example.com>',
+                date='Mon, 23 Mar 2026 12:00:00 +0000',
+                body='First review.\n',
+                in_reply_to='cover@example.com',
+            ),
+            make_msg(
+                'andrew@example.com',
+                'Re: [PATCH 0/1] Test series',
+                from_addr='Andrew <andrew@example.com>',
+                date='Mon, 23 Mar 2026 12:01:00 +0000',
+                body='Another review.\n',
+                in_reply_to='cover@example.com',
+            ),
+            make_msg(
+                'ryo@example.com',
+                'Re: [PATCH 0/1] Test series',
+                from_addr='Ryo <ryo@example.com>',
+                date='Mon, 23 Mar 2026 12:02:00 +0000',
+                body='Response to the first review.\n',
+                in_reply_to='bernhard@example.com',
+                references='<cover@example.com> <bernhard@example.com>',
+                to='Bernhard <bernhard@example.com>',
+                cc='List <list@example.com>',
+            ),
+        ]
+        with (
+            mock.patch(
+                'b4.get_smtp', side_effect=AssertionError('SMTP forbidden')
+            ) as smtp,
+            mock.patch(
+                'b4.send_mail', side_effect=AssertionError('Sending forbidden')
+            ) as send,
+        ):
+            async with app.run_test(size=(120, 30)) as pilot:
+                await pilot.pause()
+                app._show_external_comments = True
+                app._load_followup_msgs(messages)
+                await pilot.pause()
+                lv = app.query_one('#patch-list', ListView)
+                items = [item for item in lv.children if isinstance(item, FollowupItem)]
+                assert [item.msgid for item in items] == [
+                    'bernhard@example.com',
+                    'andrew@example.com',
+                    'ryo@example.com',
+                ]
+
+                app._followup_tree = True
+                app._populate_patch_list()
+                await pilot.pause()
+                items = [item for item in lv.children if isinstance(item, FollowupItem)]
+                assert [item.msgid for item in items] == [
+                    'bernhard@example.com',
+                    'ryo@example.com',
+                    'andrew@example.com',
+                ]
+                assert [item._indent for item in items] == [4, 6, 4]
+
+                lv.index = lv.children.index(items[1])
+                await pilot.pause()
+                with mock.patch.object(app, '_compose_followup_reply') as compose:
+                    await pilot.press('r')
+                assert compose.call_args.args[0]['msgid'] == 'ryo@example.com'
+
+                await pilot.pause()
+                app._followup_tree = False
+                app.call_later(app._populate_patch_list)
+                await pilot.pause()
+                assert _selected_followup(app) == 'ryo@example.com'
+                items = [item for item in lv.children if isinstance(item, FollowupItem)]
+                assert [item.msgid for item in items] == [
+                    'bernhard@example.com',
+                    'andrew@example.com',
+                    'ryo@example.com',
+                ]
+                app._followup_tree = True
+                app.call_later(app._populate_patch_list)
+                await pilot.pause()
+                assert _selected_followup(app) == 'ryo@example.com'
+
+                entry = next(
+                    entry
+                    for entry in app._followup_comments[0]
+                    if entry['msgid'] == 'ryo@example.com'
+                )
+                original_make_reply = entry['lmsg'].make_reply
+                outgoing = []
+
+                def capture_reply(body: str) -> email.message.EmailMessage:
+                    msg: email.message.EmailMessage = original_make_reply(body)
+                    outgoing.append(msg)
+                    return msg
+
+                with (
+                    mock.patch(
+                        'b4.review_tui._review_app.suspend_and_edit',
+                        return_value=b'Thanks for the response.\n',
+                    ),
+                    mock.patch.object(
+                        entry['lmsg'], 'make_reply', side_effect=capture_reply
+                    ),
+                ):
+                    await pilot.press('r')
+                    await pilot.pause()
+                    assert len(outgoing) == 1
+                    assert str(outgoing[0]['In-Reply-To']) == '<ryo@example.com>'
+                    assert '<ryo@example.com>' in str(outgoing[0]['References'])
+                    assert 'ryo@example.com' in str(outgoing[0]['To'])
+                    assert 'list@example.com' in str(outgoing[0]['Cc'])
+                    smtp.assert_not_called()
+                    send.assert_not_called()
+                    await pilot.press('escape')
+                    await pilot.pause()
+                    smtp.assert_not_called()
+                    send.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_tree_compacts_deep_branch_and_restores_it_on_resize(
+        self, gitdir: str
+    ) -> None:
+        from rich.cells import cell_len
+
+        branch, _shas = _create_review_branch_with_patches(
+            gitdir, 'followup-tree-width', ['patch 1']
+        )
+        app = ReviewApp(_build_session(gitdir, branch))
+        entries = []
+        for index in range(9):
+            entries.append(
+                {
+                    'msgid': f'node-{index}@example.com',
+                    'fromname': 'Ryo 高 reviewer'
+                    if index == 8
+                    else f'Reviewer {index}',
+                    'fromemail': f'reviewer-{index}@example.com',
+                    'date': datetime.datetime(
+                        2026, 1, index + 1, tzinfo=datetime.timezone.utc
+                    ),
+                    'body': 'A reply.',
+                    'lmsg': mock.Mock(
+                        in_reply_to=f'node-{index - 1}@example.com' if index else None
+                    ),
+                }
+            )
+        entries.append(
+            {
+                'msgid': 'other@example.com',
+                'fromname': 'Other reviewer',
+                'fromemail': 'other@example.com',
+                'date': datetime.datetime(2026, 1, 10, tzinfo=datetime.timezone.utc),
+                'body': 'A separate review.',
+                'lmsg': mock.Mock(in_reply_to=None),
+            }
+        )
+        async with app.run_test(size=(200, 40)) as pilot:
+            await pilot.pause()
+            app._followup_comments = {0: entries}
+            app._show_external_comments = True
+            app._followup_tree = True
+            app._populate_patch_list()
+            await pilot.pause()
+            lv = app.query_one('#patch-list', ListView)
+            items = [item for item in lv.children if isinstance(item, FollowupItem)]
+            assert [item._indent for item in items] == list(range(4, 22, 2)) + [4]
+
+            lv.index = lv.children.index(items[8])
+            await pilot.pause()
+            assert _selected_followup(app) == 'node-8@example.com'
+            widths = []
+            populate = app._populate_patch_list
+
+            def observe_populate() -> None:
+                widths.append(lv.content_size.width)
+                populate()
+
+            with mock.patch.object(
+                app, '_populate_patch_list', side_effect=observe_populate
+            ):
+                await pilot.resize_terminal(100, 40)
+            await pilot.pause()
+            items = [item for item in lv.children if isinstance(item, FollowupItem)]
+            indents = [item._indent for item in items[:9]]
+            gaps = [right - left for left, right in zip(indents, indents[1:])]
+            assert indents[0] == 4
+            assert indents[-1] < 20, (
+                app.size,
+                lv.size,
+                lv.content_size,
+                indents,
+                widths,
+            )
+            assert widths[-1] == lv.content_size.width
+            overflow = max(
+                0, 20 + cell_len(items[8]._display_name) - lv.content_size.width
+            )
+            assert gaps == [1] * overflow + [2] * (8 - overflow)
+            assert items[-1]._indent == 4
+            assert (
+                items[8]._indent + cell_len(items[8]._display_name)
+                <= lv.content_size.width
+            )
+            assert _selected_followup(app) == 'node-8@example.com'
+
+            await pilot.resize_terminal(200, 40)
+            await pilot.pause()
+            items = [item for item in lv.children if isinstance(item, FollowupItem)]
+            assert [item._indent for item in items] == list(range(4, 22, 2)) + [4]
+            assert _selected_followup(app) == 'node-8@example.com'
+
+            entries[8]['fromname'] = 'A' * 80
+            app._populate_patch_list()
+            await pilot.pause()
+            items = [item for item in lv.children if isinstance(item, FollowupItem)]
+            assert [item._indent for item in items[:9]] == list(range(4, 13))
+            assert items[-1]._indent == 4
+
+    @pytest.mark.asyncio
+    async def test_tree_follows_ancestors_hidden_by_body_filter(
+        self, gitdir: str
+    ) -> None:
+        branch, _shas = _create_review_branch_with_patches(
+            gitdir,
+            'followup-tree-hidden',
+            ['patch 1'],
+            series_extra={'header-info': {'msgid': 'cover@example.com'}},
+        )
+        app = ReviewApp(_build_session(gitdir, branch))
+        cover = make_msg('cover@example.com', '[PATCH 0/1] Test series')
+        root = make_msg(
+            'root@example.com',
+            'Re: [PATCH 0/1] Test series',
+            body='First review.\n',
+            in_reply_to='cover@example.com',
+            date='Mon, 23 Mar 2026 12:00:00 +0000',
+        )
+        sibling = make_msg(
+            'sibling@example.com',
+            'Re: [PATCH 0/1] Test series',
+            body='Another review.\n',
+            in_reply_to='cover@example.com',
+            date='Mon, 23 Mar 2026 12:01:00 +0000',
+        )
+        hidden = make_msg(
+            'hidden@example.com',
+            'Re: [PATCH 0/1] Test series',
+            body='Hidden parent.\n',
+            in_reply_to='root@example.com',
+            date='Mon, 23 Mar 2026 12:02:00 +0000',
+        )
+        child = make_msg(
+            'child@example.com',
+            'Re: [PATCH 0/1] Test series',
+            body='Reply to hidden parent.\n',
+            in_reply_to='hidden@example.com',
+            date='Mon, 23 Mar 2026 12:03:00 +0000',
+        )
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            app._show_external_comments = True
+            with mock.patch(
+                'b4.mbox.minimize_thread', return_value=[cover, root, sibling, child]
+            ):
+                app._load_followup_msgs([cover, root, sibling, hidden, child])
+            app._followup_tree = True
+            app._populate_patch_list()
+            await pilot.pause()
+            lv = app.query_one('#patch-list', ListView)
+            items = [item for item in lv.children if isinstance(item, FollowupItem)]
+            assert [item.msgid for item in items] == [
+                'root@example.com',
+                'child@example.com',
+                'sibling@example.com',
+            ]
+            assert [item._indent for item in items] == [4, 6, 4]
+
+    @pytest.mark.asyncio
+    async def test_followup_shortcuts(self, gitdir: str) -> None:
+        change_id = 'followup-shortcuts'
+        patch_id = f'{change_id}-patch1@example.com'
+        branch, _shas = _create_review_branch_with_patches(
+            gitdir,
+            change_id,
+            ['patch 1'],
+            series_extra={'header-info': {'msgid': 'cover@example.com'}},
+        )
+        app = ReviewApp(_build_session(gitdir, branch))
+        messages = [
+            make_msg('cover@example.com', '[PATCH 0/1] Test series'),
+            make_msg(
+                patch_id,
+                '[PATCH 1/1] patch 1',
+                body=MINIMAL_DIFF,
+                in_reply_to='cover@example.com',
+            ),
+            make_msg(
+                'review@example.com',
+                'Re: [PATCH 1/1] patch 1',
+                body='Please clarify this change.\n',
+                in_reply_to=patch_id,
+            ),
+            make_msg(
+                'reply@example.com',
+                'Re: [PATCH 1/1] patch 1',
+                body='I will clarify it.\n',
+                in_reply_to='review@example.com',
+            ),
+        ]
+        with mock.patch('b4.get_pi_thread_by_msgid', return_value=messages) as fetch:
+            async with app.run_test(size=(120, 30)) as pilot:
+                for key, visible, threaded in (
+                    ('F', True, True),
+                    ('F', False, True),
+                    ('f', True, False),
+                    ('F', True, True),
+                    ('F', False, True),
+                    ('f', True, False),
+                    ('f', False, False),
+                    ('F', True, True),
+                    ('f', False, False),
+                    ('F', True, True),
+                ):
+                    fetch_count = fetch.call_count
+                    switching = (
+                        key == 'F'
+                        and app._show_external_comments
+                        and not app._followup_tree
+                    )
+                    await pilot.press(key)
+                    await app.workers.wait_for_complete()
+                    await pilot.pause()
+                    if switching:
+                        assert fetch.call_count == fetch_count
+                    assert app._show_external_comments == visible
+                    assert app._followup_tree == threaded
+                    items = [
+                        item
+                        for item in app.query_one('#patch-list', ListView).children
+                        if isinstance(item, FollowupItem)
+                    ]
+                    if visible:
+                        assert [item.msgid for item in items] == [
+                            'review@example.com',
+                            'reply@example.com',
+                        ]
+                        assert [item._indent for item in items] == (
+                            [4, 6] if threaded else [4, 4]
+                        )
+                    else:
+                        assert not items
 
 
 class TestFollowupSnipMarker:

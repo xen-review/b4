@@ -455,6 +455,7 @@ Key                        Action
 ``n``                      Notes — view or edit review notes
 ``f``                      Followups — toggle follow-up messages and external
                            inline comments from lore
+``F``                      Toggle threaded follow-up list
 ``a``                      Agent — run review LLM agent (if configured)
 ``d``                      Done — toggle "done" state on the current patch
 ``x``                      Skip — toggle "skip" state on the current patch
@@ -820,6 +821,12 @@ reviewed. B4 first checks the locally cached thread (stored as a git
 blob in the review branch); if no local copy exists, it fetches from
 lore in the background. The ``f`` key is a toggle — pressing it again
 hides the follow-up display.
+
+Press ``F`` to open follow-ups as a threaded list, or to switch an open
+chronological list to threaded order. Press ``F`` again to hide the list.
+In the threaded list, replies appear below their parent messages;
+indentation is compacted as needed when the sidebar narrows. The selected
+message remains selected when switching views or resizing.
 
 Follow-up messages appear as coloured panels below the diff, showing
 threading depth (replies indented visually), along with From, Date, and
