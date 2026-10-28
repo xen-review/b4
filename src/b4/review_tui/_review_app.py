@@ -13,13 +13,14 @@ import subprocess
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import liblore.utils
+from rich.cells import cell_len
 from rich.rule import Rule
 from rich.syntax import Syntax
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
-from textual.events import Click
+from textual.events import Click, Resize
 from textual.widgets import Label, ListItem, ListView, RichLog, Static
 
 import b4
@@ -112,16 +113,30 @@ class PatchListItem(ListItem):
 class FollowupItem(ListItem):
     """A follow-up entry in the patch list sidebar."""
 
-    def __init__(self, name: str, display_idx: int, msgid: str) -> None:
+    def __init__(
+        self, name: str, display_idx: int, msgid: str, indent: int = 4
+    ) -> None:
         super().__init__()
         self.display_idx = display_idx
         self.msgid = msgid
         self._display_name = name
+        self._indent = indent
 
     def compose(self) -> ComposeResult:
-        st = Static(f'\u00a0\u00a0\u00a0\u00a0{self._display_name}', markup=False)
+        st = Static('\u00a0' * self._indent + self._display_name, markup=False)
         st.styles.text_style = 'dim'
         yield st
+
+
+class PatchListView(ListView):
+    def on_resize(self, event: Resize) -> None:
+        app = self.app
+        if (
+            isinstance(app, ReviewApp)
+            and app._followup_tree
+            and app._show_external_comments
+        ):
+            app.call_after_refresh(app._populate_patch_list)
 
 
 class ReviewApp(LoreNodeShutdownMixin, CheckRunnerMixin, App[None]):
@@ -209,7 +224,7 @@ class ReviewApp(LoreNodeShutdownMixin, CheckRunnerMixin, App[None]):
     """
 
     # Actions visible only in review mode
-    _REVIEW_ACTIONS = frozenset({'followups', 'agent'})
+    _REVIEW_ACTIONS = frozenset({'followups', 'toggle_followup_tree', 'agent'})
     # Actions visible only in email mode
     _EMAIL_ACTIONS = frozenset({'edit_tocc', 'send'})
 
@@ -218,6 +233,7 @@ class ReviewApp(LoreNodeShutdownMixin, CheckRunnerMixin, App[None]):
         'edit_note': 'Review',
         'edit_reply': 'Review',
         'followups': 'Review',
+        'toggle_followup_tree': 'Review',
         'agent': 'Review',
         'prior_review': 'Review',
         'patch_done': 'Review',
@@ -242,6 +258,7 @@ class ReviewApp(LoreNodeShutdownMixin, CheckRunnerMixin, App[None]):
         Binding('N', 'edit_note', 'note', key_display='N'),
         Binding('r', 'edit_reply', 'reply'),
         Binding('f', 'followups', 'followups'),
+        Binding('F', 'toggle_followup_tree', 'thread view', key_display='F'),
         Binding('a', 'agent', 'agent'),
         Binding('d', 'patch_done', 'done'),
         Binding('x', 'patch_skip', 'skip'),
@@ -309,9 +326,11 @@ class ReviewApp(LoreNodeShutdownMixin, CheckRunnerMixin, App[None]):
         self._comment_positions: List[int] = []
         self._followup_positions: Dict[str, int] = {}
         self._followup_comments: Dict[int, List[Dict[str, Any]]] = {}
+        self._followup_parents: Dict[str, Optional[str]] = {}
         self._followup_header_map: Dict[int, Dict[str, Any]] = {}
         self._selected_followup_msgid: Optional[str] = None
         self._show_external_comments: bool = False
+        self._followup_tree: bool = False
         self._followup_generation: int = 0
         self._collapsed_comment_lines: Dict[int, Tuple[str, int]] = {}
         self._reply_sent: bool = False
@@ -347,7 +366,7 @@ class ReviewApp(LoreNodeShutdownMixin, CheckRunnerMixin, App[None]):
         yield Static(id='title-bar', markup=False)
         with Horizontal():
             with Vertical(id='left-pane'):
-                yield ListView(id='patch-list')
+                yield PatchListView(id='patch-list')
                 yield Static(id='trailer-overlay', markup=False)
             yield RichLog(
                 id='diff-viewer',
@@ -401,6 +420,7 @@ class ReviewApp(LoreNodeShutdownMixin, CheckRunnerMixin, App[None]):
     def _populate_patch_list(self) -> None:
         """Populate or refresh the patch list widget."""
         lv = self.query_one('#patch-list', ListView)
+        selected_followup = self._selected_followup_msgid
         lv.clear()
 
         total = len(self._commit_shas)
@@ -418,7 +438,9 @@ class ReviewApp(LoreNodeShutdownMixin, CheckRunnerMixin, App[None]):
             if 0 == self._selected_idx:
                 restore_index = new_count
             new_count += 1
-            self._append_followup_items(lv, 0)
+            selected_offset = self._append_followup_items(lv, 0, selected_followup)
+            if selected_offset is not None:
+                restore_index = new_count + selected_offset
             new_count += len(self._followup_comments.get(0, []))
 
         # Patch entries
@@ -439,7 +461,11 @@ class ReviewApp(LoreNodeShutdownMixin, CheckRunnerMixin, App[None]):
             if patch_num == self._selected_idx:
                 restore_index = new_count
             new_count += 1
-            self._append_followup_items(lv, patch_num)
+            selected_offset = self._append_followup_items(
+                lv, patch_num, selected_followup
+            )
+            if selected_offset is not None:
+                restore_index = new_count + selected_offset
             new_count += len(self._followup_comments.get(patch_num, []))
 
         if new_count > 0:
@@ -453,15 +479,79 @@ class ReviewApp(LoreNodeShutdownMixin, CheckRunnerMixin, App[None]):
 
             self.call_after_refresh(_restore)
 
-    def _append_followup_items(self, lv: ListView, display_idx: int) -> None:
+    def _append_followup_items(
+        self, lv: ListView, display_idx: int, selected_msgid: Optional[str]
+    ) -> Optional[int]:
         """Append FollowupItem entries to *lv* for each follow-up message."""
         fc_list = self._followup_comments.get(display_idx, [])
         if not fc_list:
-            return
-        for e in fc_list:
+            return None
+        entries = (
+            self._thread_followups(fc_list)
+            if self._followup_tree
+            else [(entry, 0) for entry in fc_list]
+        )
+        compacted: Set[str] = set()
+        path: List[str] = []
+        if self._followup_tree:
+            for entry, depth in entries:
+                path = path[:depth]
+                path.append(str(entry.get('msgid', '')))
+                name = str(
+                    entry.get('fromname') or entry.get('fromemail') or '(unknown)'
+                )
+                overflow = 4 + 2 * depth + cell_len(name) - lv.content_size.width
+                compacted.update(path[1 : 1 + min(depth, max(0, overflow))])
+
+        path = []
+        selected_offset = None
+        for offset, (e, depth) in enumerate(entries):
             name = str(e.get('fromname') or e.get('fromemail') or '(unknown)')
             msgid = str(e.get('msgid', ''))
-            lv.append(FollowupItem(name, display_idx, msgid))
+            path = path[:depth]
+            path.append(msgid)
+            indent = 4 + sum(1 if ancestor in compacted else 2 for ancestor in path[1:])
+            lv.append(FollowupItem(name, display_idx, msgid, indent))
+            if msgid == selected_msgid:
+                selected_offset = offset
+        return selected_offset
+
+    def _thread_followups(
+        self, entries: List[Dict[str, Any]]
+    ) -> List[Tuple[Dict[str, Any], int]]:
+        """Order follow-ups by parent, keeping siblings in chronological order."""
+        msgids = {entry.get('msgid') for entry in entries}
+        children: Dict[Optional[str], List[Dict[str, Any]]] = {}
+        for entry in entries:
+            parent = getattr(entry.get('lmsg'), 'in_reply_to', None)
+            seen: Set[str] = set()
+            while parent and parent not in msgids and parent not in seen:
+                seen.add(parent)
+                parent = self._followup_parents.get(parent)
+            if parent not in msgids or parent == entry.get('msgid'):
+                parent = None
+            children.setdefault(parent, []).append(entry)
+
+        ordered: List[Tuple[Dict[str, Any], int]] = []
+        visited: Set[str] = set()
+        for root in children.get(None, []) + entries:
+            stack = [(root, 0)]
+            while stack:
+                entry, depth = stack.pop()
+                msgid = str(entry.get('msgid', ''))
+                if msgid in visited:
+                    continue
+                visited.add(msgid)
+                ordered.append((entry, depth))
+                stack.extend(
+                    (child, depth + 1) for child in reversed(children.get(msgid, []))
+                )
+        return ordered
+
+    def action_toggle_followup_tree(self) -> None:
+        """Toggle between chronological and threaded follow-up lists."""
+        self._followup_tree = not self._followup_tree
+        self._populate_patch_list()
 
     def _refresh_patch_item(self, display_idx: int) -> None:
         """Refresh a single patch list item's label."""
@@ -1942,6 +2032,9 @@ class ReviewApp(LoreNodeShutdownMixin, CheckRunnerMixin, App[None]):
         lmbx = b4.LoreMailbox()
         for msg in msgs:
             lmbx.add_message(msg)
+        self._followup_parents = {
+            msgid: lmsg.in_reply_to for msgid, lmsg in lmbx.msgid_map.items()
+        }
 
         # Build patch_msgids: msgid -> display_idx
         patch_msgids: Dict[str, int] = {}

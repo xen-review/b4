@@ -434,6 +434,7 @@ Key                        Action
 ``n``                      Notes — view or edit review notes
 ``f``                      Followups — toggle follow-up messages and external
                            inline comments from lore
+``F``                      Toggle threaded follow-up list
 ``a``                      Agent — run review LLM agent (if configured)
 ``d``                      Done — toggle "done" state on the current patch
 ``x``                      Skip — toggle "skip" state on the current patch
@@ -801,6 +802,11 @@ the fetch fails, it displays any available cached messages and warns
 that the follow-ups may be incomplete or out of date. The ``f`` key is a
 toggle — pressing it again hides the follow-up display; toggle it back on
 to refresh the thread again.
+
+Press ``F`` to switch the sidebar between chronological follow-ups and a
+threaded list. In the threaded list, replies appear below their parent
+messages; indentation is compacted as needed when the sidebar narrows.
+The selected message remains selected when switching views or resizing.
 
 Follow-up messages appear as coloured panels below the diff, showing
 threading depth (replies indented visually), along with From, Date, and
