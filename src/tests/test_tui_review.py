@@ -11,13 +11,17 @@ via git rebase -i), range-diff filtering and gating, check-detail
 rendering, and the branch-restore logic on exit.
 """
 
+import asyncio
 import datetime
 import email.message
 import json
+import threading
 from typing import Any, Dict, List, Optional, Tuple
 from unittest import mock
 
 import pytest
+
+import liblore
 
 pytest.importorskip('textual')
 
@@ -29,6 +33,7 @@ import b4.review.tracking
 from b4.review_tui._common import filter_range_diff_for_commit
 from b4.review_tui._review_app import FollowupItem, PatchListItem, ReviewApp
 
+from .helpers.mail import MINIMAL_DIFF, make_msg
 from .helpers.tracking import create_review_branch
 from .helpers.tui import CUT_BUFFER, CUT_INSTRUCTION, CUT_TRIMMED
 
@@ -371,6 +376,478 @@ class TestFollowupSelection:
             with mock.patch.object(app, '_compose_followup_reply') as compose:
                 app.action_edit_reply()
             compose.assert_called_once_with(entries[1])
+
+
+def _create_followup_fixture(
+    gitdir: str, change_id: str
+) -> Tuple[str, str, List[email.message.EmailMessage]]:
+    cover_id = 'cover@example.com'
+    patch_id = f'{change_id}-patch1@example.com'
+    branch, _shas = _create_review_branch_with_patches(
+        gitdir,
+        change_id,
+        ['patch 1'],
+        series_extra={'header-info': {'msgid': cover_id}},
+    )
+    cover = make_msg(cover_id, '[PATCH 0/1] Test series')
+    patch = make_msg(
+        patch_id, '[PATCH 1/1] patch 1', body=MINIMAL_DIFF, in_reply_to=cover_id
+    )
+    review = make_msg(
+        'review@example.com',
+        'Re: [PATCH 1/1] patch 1',
+        body='Please clarify this change.\n',
+        in_reply_to=patch_id,
+    )
+    reply = make_msg(
+        'reply@example.com',
+        'Re: [PATCH 1/1] patch 1',
+        from_addr='Author <author@example.com>',
+        body='I will clarify it.\n',
+        in_reply_to='review@example.com',
+    )
+    stale_sha = b4.review.tracking._store_thread_blob(
+        gitdir, change_id, [cover, patch, review]
+    )
+    assert stale_sha is not None and stale_sha
+    return branch, stale_sha, [cover, patch, review, reply]
+
+
+class TestFollowupFetching:
+    @pytest.mark.asyncio
+    async def test_f_refreshes_stale_thread_and_displays_nested_reply(
+        self, gitdir: str
+    ) -> None:
+        branch, stale_sha, msgs = _create_followup_fixture(gitdir, 'followup-refresh')
+        app = ReviewApp(_build_session(gitdir, branch))
+
+        with (
+            mock.patch('b4.get_pi_thread_by_msgid', return_value=msgs) as fetch,
+            mock.patch('b4.get_smtp', side_effect=AssertionError('SMTP forbidden')),
+            mock.patch('b4.send_mail', side_effect=AssertionError('Sending forbidden')),
+        ):
+            async with app.run_test(size=(120, 30)) as pilot:
+                await pilot.pause()
+                await pilot.press('f')
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+
+                fetch.assert_called_once_with(
+                    'cover@example.com', nocache=True, quiet=True
+                )
+                followups = app._followup_comments[1]
+                assert [entry['msgid'] for entry in followups] == [
+                    'review@example.com',
+                    'reply@example.com',
+                ]
+                assert followups[1]['depth'] == 1
+                items = app.query_one('#patch-list', ListView).children
+                assert any(
+                    isinstance(item, FollowupItem) and item.msgid == 'reply@example.com'
+                    for item in items
+                )
+
+                _cover, tracking = b4.review.load_tracking(gitdir, branch)
+                assert tracking['series']['thread-blob'] != stale_sha
+
+    @pytest.mark.parametrize('error', [None, RuntimeError('Lore unavailable')])
+    @pytest.mark.asyncio
+    async def test_f_falls_back_to_snapshot_without_rewriting_it(
+        self, gitdir: str, error: Optional[Exception]
+    ) -> None:
+        branch, stale_sha, _msgs = _create_followup_fixture(gitdir, 'followup-offline')
+        app = ReviewApp(_build_session(gitdir, branch))
+        ecode, old_tip = b4.git_run_command(gitdir, ['rev-parse', branch])
+        assert ecode == 0
+
+        with (
+            mock.patch(
+                'b4.get_pi_thread_by_msgid', return_value=None, side_effect=error
+            ) as fetch,
+            mock.patch('b4.review.tracking._store_thread_blob') as store,
+            mock.patch.object(app, 'notify') as notify,
+            mock.patch('b4.get_smtp', side_effect=AssertionError('SMTP forbidden')),
+            mock.patch('b4.send_mail', side_effect=AssertionError('Sending forbidden')),
+        ):
+            async with app.run_test(size=(120, 30)) as pilot:
+                await pilot.pause()
+                await pilot.press('f')
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+
+                fetch.assert_called_once_with(
+                    'cover@example.com', nocache=True, quiet=True
+                )
+                store.assert_not_called()
+                notify.assert_any_call(
+                    'Lore refresh incomplete; follow-ups may be missing or out of date',
+                    severity='warning',
+                )
+                assert [entry['msgid'] for entry in app._followup_comments[1]] == [
+                    'review@example.com'
+                ]
+                assert app._series['thread-blob'] == stale_sha
+                ecode, new_tip = b4.git_run_command(gitdir, ['rev-parse', branch])
+                assert ecode == 0
+                assert new_tip == old_tip
+
+    @pytest.mark.parametrize('blob_sha', ['', '0' * 40])
+    @pytest.mark.asyncio
+    async def test_f_does_not_retry_lore_when_snapshot_is_missing_or_invalid(
+        self, gitdir: str, blob_sha: str
+    ) -> None:
+        branch, _stale_sha, _msgs = _create_followup_fixture(
+            gitdir, 'followup-no-snapshot'
+        )
+        app = ReviewApp(_build_session(gitdir, branch))
+        app._series['thread-blob'] = blob_sha
+
+        with (
+            mock.patch('b4.get_pi_thread_by_msgid', return_value=None) as fetch,
+            mock.patch.object(app, 'notify') as notify,
+            mock.patch('b4.get_smtp', side_effect=AssertionError('SMTP forbidden')),
+            mock.patch('b4.send_mail', side_effect=AssertionError('Sending forbidden')),
+        ):
+            async with app.run_test(size=(120, 30)) as pilot:
+                await pilot.pause()
+                await pilot.press('f')
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+
+                fetch.assert_called_once_with(
+                    'cover@example.com', nocache=True, quiet=True
+                )
+                notify.assert_any_call('Could not load thread', severity='error')
+
+    @pytest.mark.parametrize('mode', ['complete', 'missing', 'error', 'offline'])
+    @pytest.mark.asyncio
+    async def test_f_refreshes_rethreaded_patches_and_merges_fallback(
+        self, gitdir: str, mode: str
+    ) -> None:
+        change_id = 'followup-rethreaded'
+        patch_ids = [f'{change_id}-patch{index}@example.com' for index in (1, 2)]
+        branch, _shas = _create_review_branch_with_patches(
+            gitdir,
+            change_id,
+            ['patch 1', 'patch 2'],
+            series_extra={
+                'header-info': {'msgid': patch_ids[0]},
+                'is-rethreaded': True,
+            },
+        )
+        patches = [
+            make_msg(
+                patch_ids[index], f'[PATCH {index + 1}/2] patch', body=MINIMAL_DIFF
+            )
+            for index in range(2)
+        ]
+        reviews = [
+            make_msg(
+                f'review-{index + 1}@example.com',
+                f'Re: [PATCH {index + 1}/2] patch',
+                body=f'Comment on patch {index + 1}.\n',
+                in_reply_to=patch_ids[index],
+            )
+            for index in range(2)
+        ]
+        replies = [
+            make_msg(
+                f'reply-{index + 1}@example.com',
+                f'Re: [PATCH {index + 1}/2] patch',
+                from_addr='Author <author@example.com>',
+                body=f'Response to patch {index + 1}.\n',
+                in_reply_to=f'review-{index + 1}@example.com',
+            )
+            for index in range(2)
+        ]
+        stale_sha = b4.review.tracking._store_thread_blob(
+            gitdir, change_id, patches + reviews
+        )
+        assert stale_sha is not None and stale_sha
+        app = ReviewApp(_build_session(gitdir, branch))
+
+        def fake_fetch(msgid: str, **_kwargs: Any) -> Any:
+            if mode == 'offline':
+                return None
+            if msgid == patch_ids[0]:
+                return [patches[0], reviews[0], replies[0]]
+            if mode == 'error':
+                raise RuntimeError('Second patch unavailable')
+            if mode == 'missing':
+                return None
+            return [patches[1], reviews[1], replies[1], patches[0], reviews[0]]
+
+        with (
+            mock.patch('b4.get_pi_thread_by_msgid', side_effect=fake_fetch) as fetch,
+            mock.patch(
+                'b4.review.tracking._store_thread_blob',
+                wraps=b4.review.tracking._store_thread_blob,
+            ) as store,
+            mock.patch.object(app, 'notify') as notify,
+            mock.patch('b4.get_smtp', side_effect=AssertionError('SMTP forbidden')),
+            mock.patch('b4.send_mail', side_effect=AssertionError('Sending forbidden')),
+        ):
+            async with app.run_test(size=(120, 30)) as pilot:
+                await pilot.pause()
+                await pilot.press('f')
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+
+                assert fetch.call_args_list == [
+                    mock.call(patch_ids[0], nocache=True, quiet=True),
+                    mock.call(patch_ids[1], nocache=True, quiet=True),
+                ]
+                first_ids = [entry['msgid'] for entry in app._followup_comments[1]]
+                second_ids = [entry['msgid'] for entry in app._followup_comments[2]]
+                assert first_ids == (
+                    ['review-1@example.com']
+                    if mode == 'offline'
+                    else ['review-1@example.com', 'reply-1@example.com']
+                )
+                assert second_ids == (
+                    ['review-2@example.com', 'reply-2@example.com']
+                    if mode == 'complete'
+                    else ['review-2@example.com']
+                )
+                if mode == 'offline':
+                    store.assert_not_called()
+                    assert app._series['thread-blob'] == stale_sha
+                else:
+                    store.assert_called_once()
+                    assert app._series['thread-blob'] != stale_sha
+                warning = mock.call(
+                    'Lore refresh incomplete; follow-ups may be missing or out of date',
+                    severity='warning',
+                )
+                if mode == 'complete':
+                    assert warning not in notify.call_args_list
+                else:
+                    assert warning in notify.call_args_list
+
+    @pytest.mark.asyncio
+    async def test_f_preserves_review_edits_and_refreshed_context(
+        self, gitdir: str
+    ) -> None:
+        branch, stale_sha, msgs = _create_followup_fixture(gitdir, 'followup-edits')
+        app = ReviewApp(_build_session(gitdir, branch))
+        old_context = app._series['thread-context-blob']
+        started = threading.Event()
+        proceed = threading.Event()
+
+        def fake_fetch(_msgid: str, **_kwargs: Any) -> Any:
+            started.set()
+            if not proceed.wait(5):
+                raise RuntimeError('Test did not release fetch')
+            return msgs
+
+        with (
+            mock.patch('b4.get_pi_thread_by_msgid', side_effect=fake_fetch),
+            mock.patch('b4.get_smtp', side_effect=AssertionError('SMTP forbidden')),
+            mock.patch('b4.send_mail', side_effect=AssertionError('Sending forbidden')),
+        ):
+            async with app.run_test(size=(120, 30)) as pilot:
+                try:
+                    await pilot.pause()
+                    await pilot.press('f')
+                    assert await asyncio.to_thread(started.wait, 5)
+                    app._series['reviews'] = {'reviewer@example.com': {'note': 'Keep'}}
+                    assert app._save_tracking()
+                finally:
+                    proceed.set()
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+
+                _cover, tracking = b4.review.load_tracking(gitdir, branch)
+                series = tracking['series']
+                assert series['reviews']['reviewer@example.com']['note'] == 'Keep'
+                assert series['thread-blob'] != stale_sha
+                assert series['thread-context-blob'] != old_context
+                assert (
+                    app._series['thread-context-blob'] == series['thread-context-blob']
+                )
+                assert app._save_tracking()
+                _cover, tracking = b4.review.load_tracking(gitdir, branch)
+                assert (
+                    tracking['series']['thread-context-blob']
+                    == series['thread-context-blob']
+                )
+
+    @pytest.mark.asyncio
+    async def test_f_hides_followups_when_toggled_off_during_fetch(
+        self, gitdir: str
+    ) -> None:
+        branch, _stale_sha, msgs = _create_followup_fixture(gitdir, 'followup-toggle')
+        app = ReviewApp(_build_session(gitdir, branch))
+        started = threading.Event()
+        proceed = threading.Event()
+
+        def fake_fetch(_msgid: str, **_kwargs: Any) -> Any:
+            started.set()
+            if not proceed.wait(5):
+                raise RuntimeError('Test did not release fetch')
+            return msgs
+
+        with (
+            mock.patch('b4.get_pi_thread_by_msgid', side_effect=fake_fetch),
+            mock.patch('b4.review.tracking._store_thread_blob') as store,
+            mock.patch('b4.get_smtp', side_effect=AssertionError('SMTP forbidden')),
+            mock.patch('b4.send_mail', side_effect=AssertionError('Sending forbidden')),
+        ):
+            async with app.run_test(size=(120, 30)) as pilot:
+                try:
+                    await pilot.pause()
+                    await pilot.press('f')
+                    assert await asyncio.to_thread(started.wait, 5)
+                    await pilot.press('f')
+                finally:
+                    proceed.set()
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+
+                assert not app._show_external_comments
+                assert not app._followup_comments
+                store.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_cancelled_fetch_does_not_load_or_replace_snapshot(
+        self, gitdir: str
+    ) -> None:
+        branch, stale_sha, _msgs = _create_followup_fixture(gitdir, 'followup-cancel')
+        app = ReviewApp(_build_session(gitdir, branch))
+
+        with (
+            mock.patch(
+                'b4.get_pi_thread_by_msgid',
+                side_effect=liblore.OperationCancelledError('cancelled'),
+            ) as fetch,
+            mock.patch('b4.review.tracking._store_thread_blob') as store,
+            mock.patch.object(app, 'notify') as notify,
+            mock.patch('b4.get_smtp', side_effect=AssertionError('SMTP forbidden')),
+            mock.patch('b4.send_mail', side_effect=AssertionError('Sending forbidden')),
+        ):
+            async with app.run_test(size=(120, 30)) as pilot:
+                await pilot.pause()
+                await pilot.press('f')
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+
+                fetch.assert_called_once_with(
+                    'cover@example.com', nocache=True, quiet=True
+                )
+                store.assert_not_called()
+                assert app._series['thread-blob'] == stale_sha
+                assert not app._followup_comments
+                assert (
+                    mock.call('Could not load thread', severity='error')
+                    not in notify.call_args_list
+                )
+
+    @pytest.mark.asyncio
+    async def test_f_refreshes_again_without_rewriting_unchanged_snapshot(
+        self, gitdir: str
+    ) -> None:
+        branch, _stale_sha, msgs = _create_followup_fixture(gitdir, 'followup-repeat')
+        app = ReviewApp(_build_session(gitdir, branch))
+
+        with (
+            mock.patch('b4.get_pi_thread_by_msgid', return_value=msgs) as fetch,
+            mock.patch('b4.get_smtp', side_effect=AssertionError('SMTP forbidden')),
+            mock.patch('b4.send_mail', side_effect=AssertionError('Sending forbidden')),
+        ):
+            async with app.run_test(size=(120, 30)) as pilot:
+                await pilot.pause()
+                await pilot.press('f')
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+                ecode, first_tip = b4.git_run_command(gitdir, ['rev-parse', branch])
+                assert ecode == 0
+
+                await pilot.press('f')
+                await pilot.press('f')
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+
+                assert fetch.call_args_list == [
+                    mock.call('cover@example.com', nocache=True, quiet=True),
+                    mock.call('cover@example.com', nocache=True, quiet=True),
+                ]
+                ecode, second_tip = b4.git_run_command(gitdir, ['rev-parse', branch])
+                assert ecode == 0
+                assert second_tip == first_tip
+                assert [entry['msgid'] for entry in app._followup_comments[1]] == [
+                    'review@example.com',
+                    'reply@example.com',
+                ]
+
+    @pytest.mark.asyncio
+    async def test_older_fetch_cannot_replace_newer_followups(
+        self, gitdir: str
+    ) -> None:
+        branch, _stale_sha, msgs = _create_followup_fixture(gitdir, 'followup-race')
+        app = ReviewApp(_build_session(gitdir, branch))
+        newer = make_msg(
+            'newer@example.com',
+            'Re: [PATCH 1/1] patch 1',
+            body='A newer response.\n',
+            in_reply_to='reply@example.com',
+        )
+        started = threading.Event()
+        proceed = threading.Event()
+        newer_loaded = threading.Event()
+        lock = threading.Lock()
+        fetch_count = 0
+        original_load = app._load_followup_msgs
+
+        def fake_fetch(_msgid: str, **_kwargs: Any) -> Any:
+            nonlocal fetch_count
+            with lock:
+                fetch_count += 1
+                fetch_number = fetch_count
+            if fetch_number == 1:
+                started.set()
+                if not proceed.wait(5):
+                    raise RuntimeError('Test did not release first fetch')
+                return msgs[:-1]
+            return msgs + [newer]
+
+        def observe_load(loaded: List[Any]) -> None:
+            original_load(loaded)
+            if any(
+                b4.LoreMessage.get_clean_msgid(msg) == 'newer@example.com'
+                for msg in loaded
+            ):
+                newer_loaded.set()
+
+        with (
+            mock.patch('b4.get_pi_thread_by_msgid', side_effect=fake_fetch),
+            mock.patch.object(app, '_load_followup_msgs', side_effect=observe_load),
+            mock.patch('b4.get_smtp', side_effect=AssertionError('SMTP forbidden')),
+            mock.patch('b4.send_mail', side_effect=AssertionError('Sending forbidden')),
+        ):
+            async with app.run_test(size=(120, 30)) as pilot:
+                try:
+                    await pilot.pause()
+                    await pilot.press('f')
+                    assert await asyncio.to_thread(started.wait, 5)
+                    await pilot.press('f')
+                    await pilot.press('f')
+                    assert await asyncio.to_thread(newer_loaded.wait, 5)
+                    ecode, new_tip = b4.git_run_command(gitdir, ['rev-parse', branch])
+                    assert ecode == 0
+                finally:
+                    proceed.set()
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+
+                assert fetch_count == 2
+                assert [entry['msgid'] for entry in app._followup_comments[1]] == [
+                    'review@example.com',
+                    'reply@example.com',
+                    'newer@example.com',
+                ]
+                ecode, final_tip = b4.git_run_command(gitdir, ['rev-parse', branch])
+                assert ecode == 0
+                assert final_tip == new_tip
 
 
 class TestFollowupSnipMarker:

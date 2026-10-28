@@ -795,10 +795,12 @@ in the patch selection dialog.
 **Follow-up messages**
 
 Press ``f`` to load and display follow-up messages for the series being
-reviewed. B4 first checks the locally cached thread (stored as a git
-blob in the review branch); if no local copy exists, it fetches from
-lore in the background. The ``f`` key is a toggle — pressing it again
-hides the follow-up display.
+reviewed. B4 fetches the latest thread from lore in the background and
+updates the cached thread stored as a git blob in the review branch. If
+the fetch fails, it displays any available cached messages and warns
+that the follow-ups may be incomplete or out of date. The ``f`` key is a
+toggle — pressing it again hides the follow-up display; toggle it back on
+to refresh the thread again.
 
 Follow-up messages appear as coloured panels below the diff, showing
 threading depth (replies indented visually), along with From, Date, and
