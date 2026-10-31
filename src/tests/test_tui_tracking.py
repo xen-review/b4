@@ -1932,6 +1932,54 @@ class TestTrackingWithReviewBranch:
         conn.close()
         assert tuple(row) == (10, 10)
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'status', ['replied', 'partial', 'waiting', 'accepted', 'snoozed', 'thanked']
+    )
+    async def test_enter_visits_existing_review_without_reopening(
+        self, gitdir: str, status: str
+    ) -> None:
+        identifier = f'test-visit-{status}'
+        change_id = f'visit-{status}-1'
+        branch = create_review_branch(
+            gitdir, change_id, identifier=identifier, status=status
+        )
+        seed_db(
+            identifier,
+            [
+                {
+                    'change_id': change_id,
+                    'subject': '[PATCH] visit test',
+                    'status': status,
+                    'message_id': 'visit@ex.com',
+                    'message_count': 10,
+                    'seen_message_count': 3,
+                }
+            ],
+        )
+        ecode, old_tip = b4.git_run_command(gitdir, ['rev-parse', branch])
+        assert ecode == 0
+
+        app = TrackingApp(identifier)
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            await pilot.press('enter')
+            await pilot.pause()
+            assert app.return_value == branch
+
+        assert _get_db_status(identifier, change_id) == status
+        conn = tracking.get_db(identifier)
+        row = conn.execute(
+            'SELECT message_count, seen_message_count FROM series WHERE change_id = ?',
+            (change_id,),
+        ).fetchone()
+        conn.close()
+        assert tuple(row) == (10, 3)
+        ecode, new_tip = b4.git_run_command(gitdir, ['rev-parse', branch])
+        assert ecode == 0
+        assert new_tip == old_tip
+        assert app._visit_existing_review
+
 
 class TestTrackingActionMenu:
     """The context-sensitive action menu.
@@ -2140,6 +2188,34 @@ class TestTrackingActionMenu:
             assert isinstance(app.screen, ActionScreen)
 
             await pilot.press('escape')
+
+    @pytest.mark.asyncio
+    async def test_enter_on_missing_review_branch_opens_action_menu(
+        self, gitdir: str
+    ) -> None:
+        create_review_branch(gitdir, 'enter-missing-1', identifier='test-enter-missing')
+        seed_db(
+            'test-enter-missing',
+            [
+                {
+                    'change_id': 'enter-missing-1',
+                    'subject': '[PATCH] missing review branch',
+                    'status': 'reviewing',
+                    'message_id': 'enter-missing@ex.com',
+                }
+            ],
+        )
+
+        app = TrackingApp('test-enter-missing')
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            assert app._selected_series is not None
+            assert app._selected_series['status'] == 'reviewing'
+            with patch('b4.git_branch_exists', return_value=False):
+                await pilot.press('enter')
+                await pilot.pause()
+            assert isinstance(app.screen, ActionScreen)
+            assert not app._exit
 
 
 class TestTrackingUpgradeNewSeries:
@@ -6104,6 +6180,7 @@ class TestTrackingEntryBranchRestore:
 
         class _ReviewsThenQuits:
             PATCHWORK_SENTINEL = TrackingApp.PATCHWORK_SENTINEL
+            _visit_existing_review = False
 
             def __init__(
                 self, identifier: str, original_branch: Optional[str], **kw: Any
@@ -6138,6 +6215,54 @@ class TestTrackingEntryBranchRestore:
             _entry.run_tracking_tui('test-entry-dbclose')
 
         assert closed == [True]
+
+    @pytest.mark.parametrize('final_status', ['waiting', 'replied'])
+    def test_visit_syncs_only_a_changed_review_status(
+        self, gitdir: str, final_status: str
+    ) -> None:
+        branch = 'b4/review/entry-visit-1'
+        runs = {'n': 0}
+
+        class _VisitsThenQuits:
+            PATCHWORK_SENTINEL = TrackingApp.PATCHWORK_SENTINEL
+            _visit_existing_review = True
+
+            def __init__(
+                self, identifier: str, original_branch: Optional[str], **kw: Any
+            ) -> None:
+                pass
+
+            def run(self, mouse: bool = True) -> Optional[str]:
+                runs['n'] += 1
+                return branch if runs['n'] == 1 else None
+
+        conn = MagicMock()
+        with (
+            patch.object(_entry, 'TrackingApp', _VisitsThenQuits),
+            patch.object(_entry, 'ReviewApp'),
+            patch.object(
+                b4.review,
+                '_prepare_review_session',
+                return_value={'series': {'revision': 1, 'status': 'waiting'}},
+            ),
+            patch.object(
+                b4.review,
+                'load_tracking',
+                return_value=('', {'series': {'status': final_status}}),
+            ),
+            patch.object(tracking, 'get_db', return_value=conn),
+            patch.object(tracking, 'update_series_status') as update_status,
+        ):
+            _entry.run_tracking_tui('test-entry-visit')
+
+        if final_status == 'waiting':
+            update_status.assert_not_called()
+            conn.close.assert_not_called()
+        else:
+            update_status.assert_called_once_with(
+                conn, 'entry-visit-1', 'replied', revision=1
+            )
+            conn.close.assert_called_once()
 
 
 class TestBadCharsGuard:

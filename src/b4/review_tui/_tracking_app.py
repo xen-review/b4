@@ -1168,6 +1168,7 @@ class TrackingApp(LoreNodeShutdownMixin, CheckRunnerMixin, App[Optional[str]]):
         self._patatt_sign = patatt_sign
         self._all_series: List[Dict[str, Any]] = []
         self._selected_series: Optional[Dict[str, Any]] = None
+        self._visit_existing_review: bool = False
         # Message-IDs the reviewer has explicitly cleared through the
         # unicode control-character guard, for this session only.
         self._badchars_ok: Set[str] = set()
@@ -1651,10 +1652,20 @@ class TrackingApp(LoreNodeShutdownMixin, CheckRunnerMixin, App[Optional[str]]):
             if not self._selected_series:
                 return
             status = self._selected_series.get('status', 'new')
-            if status == 'reviewing':
+            change_id = self._selected_series.get('change_id', '')
+            branch_name = f'b4/review/{change_id}'
+            topdir = b4.git_get_toplevel()
+            if (
+                not change_id
+                or not topdir
+                or not b4.git_branch_exists(topdir, branch_name)
+            ):
+                self.action_action()
+            elif status == 'reviewing':
                 self.action_review()
             else:
-                self.action_action()
+                self._visit_existing_review = True
+                self.exit(branch_name)
 
     _STATE_ACTIONS: Dict[str, frozenset[str]] = {
         'new': frozenset(
