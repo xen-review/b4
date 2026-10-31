@@ -803,8 +803,9 @@ that the follow-ups may be incomplete or out of date. The ``f`` key is a
 toggle — pressing it again hides the follow-up display; toggle it back on
 to refresh the thread again.
 
-Press ``F`` to switch the sidebar between chronological follow-ups and a
-threaded list. In the threaded list, replies appear below their parent
+The sidebar shows follow-ups as a threaded list by default. Press ``F``
+to switch between this view and chronological order. In the threaded
+list, replies appear below their parent
 messages; indentation is compacted as needed when the sidebar narrows.
 The selected message remains selected when switching views or resizing.
 

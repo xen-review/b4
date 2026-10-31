@@ -379,6 +379,13 @@ class TestFollowupSelection:
 
 
 class TestFollowupTree:
+    def test_threaded_view_is_default(self, gitdir: str) -> None:
+        branch, _shas = _create_review_branch_with_patches(
+            gitdir, 'followup-tree-default', ['patch 1']
+        )
+        app = ReviewApp(_build_session(gitdir, branch))
+        assert app._followup_tree is True
+
     def test_tree_keeps_orphans_and_breaks_cycles(self, gitdir: str) -> None:
         branch, _shas = _create_review_branch_with_patches(
             gitdir, 'followup-tree-cycles', ['patch 1']
@@ -456,6 +463,16 @@ class TestFollowupTree:
                 items = [item for item in lv.children if isinstance(item, FollowupItem)]
                 assert [item.msgid for item in items] == [
                     'bernhard@example.com',
+                    'ryo@example.com',
+                    'andrew@example.com',
+                ]
+                assert [item._indent for item in items] == [4, 6, 4]
+
+                await pilot.press('F')
+                await pilot.pause()
+                items = [item for item in lv.children if isinstance(item, FollowupItem)]
+                assert [item.msgid for item in items] == [
+                    'bernhard@example.com',
                     'andrew@example.com',
                     'ryo@example.com',
                 ]
@@ -463,12 +480,6 @@ class TestFollowupTree:
                 await pilot.press('F')
                 await pilot.pause()
                 items = [item for item in lv.children if isinstance(item, FollowupItem)]
-                assert [item.msgid for item in items] == [
-                    'bernhard@example.com',
-                    'ryo@example.com',
-                    'andrew@example.com',
-                ]
-                assert [item._indent for item in items] == [4, 6, 4]
 
                 lv.index = lv.children.index(items[1])
                 await pilot.pause()
@@ -567,7 +578,7 @@ class TestFollowupTree:
             await pilot.pause()
             app._followup_comments = {0: entries}
             app._show_external_comments = True
-            await pilot.press('F')
+            app._populate_patch_list()
             await pilot.pause()
             lv = app.query_one('#patch-list', ListView)
             items = [item for item in lv.children if isinstance(item, FollowupItem)]
@@ -671,7 +682,6 @@ class TestFollowupTree:
                 'b4.mbox.minimize_thread', return_value=[cover, root, sibling, child]
             ):
                 app._load_followup_msgs([cover, root, sibling, hidden, child])
-            await pilot.press('F')
             await pilot.pause()
             lv = app.query_one('#patch-list', ListView)
             items = [item for item in lv.children if isinstance(item, FollowupItem)]
