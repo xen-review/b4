@@ -181,7 +181,7 @@ Symbol   Status
 ============  ===========================================================
 Key           Action
 ============  ===========================================================
-``Enter``     Enter series (reviewing) or open action menu (other states)
+``Enter``     Visit an existing review, or open the action menu if none exists
 ``r``         Review — create or re-enter the review branch
 ``t``         Target branch — set or clear the per-series target branch
 ``c``         CI checks — run configured check commands and show results
