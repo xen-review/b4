@@ -330,7 +330,7 @@ class ReviewApp(LoreNodeShutdownMixin, CheckRunnerMixin, App[None]):
         self._followup_header_map: Dict[int, Dict[str, Any]] = {}
         self._selected_followup_msgid: Optional[str] = None
         self._show_external_comments: bool = False
-        self._followup_tree: bool = False
+        self._followup_tree: bool = True
         self._followup_generation: int = 0
         self._collapsed_comment_lines: Dict[int, Tuple[str, int]] = {}
         self._reply_sent: bool = False
