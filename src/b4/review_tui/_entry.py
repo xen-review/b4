@@ -177,6 +177,7 @@ def run_tracking_tui(
 
             session['email_dryrun'] = email_dryrun
             session['patatt_sign'] = patatt_sign
+            initial_status = session['series'].get('status')
             review_app = ReviewApp(session)
             review_app.run(mouse=use_mouse)
 
@@ -195,7 +196,14 @@ def run_tracking_tui(
                 _cover_text, tracking = b4.review.load_tracking(topdir, branch_name)
                 tracking_status = tracking.get('series', {}).get('status')
                 revision = session['series'].get('revision')
-                if tracking_status and focus_change_id:
+                if (
+                    tracking_status
+                    and focus_change_id
+                    and (
+                        not app._visit_existing_review
+                        or tracking_status != initial_status
+                    )
+                ):
                     conn = b4.review.tracking.get_db(identifier)
                     b4.review.tracking.update_series_status(
                         conn, focus_change_id, tracking_status, revision=revision
