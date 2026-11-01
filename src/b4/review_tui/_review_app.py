@@ -224,7 +224,9 @@ class ReviewApp(LoreNodeShutdownMixin, CheckRunnerMixin, App[None]):
     """
 
     # Actions visible only in review mode
-    _REVIEW_ACTIONS = frozenset({'followups', 'toggle_followup_tree', 'agent'})
+    _REVIEW_ACTIONS = frozenset(
+        {'followups', 'refresh_followups', 'toggle_followup_tree', 'agent'}
+    )
     # Actions visible only in email mode
     _EMAIL_ACTIONS = frozenset({'edit_tocc', 'send'})
 
@@ -233,6 +235,7 @@ class ReviewApp(LoreNodeShutdownMixin, CheckRunnerMixin, App[None]):
         'edit_note': 'Review',
         'edit_reply': 'Review',
         'followups': 'Review',
+        'refresh_followups': 'Review',
         'toggle_followup_tree': 'Review',
         'agent': 'Review',
         'prior_review': 'Review',
@@ -258,6 +261,7 @@ class ReviewApp(LoreNodeShutdownMixin, CheckRunnerMixin, App[None]):
         Binding('N', 'edit_note', 'note', key_display='N'),
         Binding('r', 'edit_reply', 'reply'),
         Binding('f', 'followups', 'followups'),
+        Binding('R', 'refresh_followups', 'refresh', key_display='R'),
         Binding('F', 'toggle_followup_tree', 'thread view', key_display='F'),
         Binding('a', 'agent', 'agent'),
         Binding('d', 'patch_done', 'done'),
@@ -383,6 +387,30 @@ class ReviewApp(LoreNodeShutdownMixin, CheckRunnerMixin, App[None]):
         self._refresh_title_bar()
         self._populate_patch_list()
         self._show_content(self._selected_idx)
+        blob_sha = self._series.get('thread-blob', '')
+        if blob_sha:
+            try:
+                msgs = self._read_followup_blob(blob_sha)
+                if msgs:
+                    self._show_external_comments = True
+                    self._load_followup_msgs(msgs, cached=True)
+                else:
+                    self.notify(
+                        'Could not load cached follow-ups; press R to refresh',
+                        severity='warning',
+                    )
+            except Exception as ex:
+                logger.debug('Could not load cached follow-ups: %s', ex, exc_info=True)
+                self._show_external_comments = False
+                self._followup_comments = {}
+                self._followup_parents = {}
+                self._followup_positions = {}
+                self._populate_patch_list()
+                self._show_content(self._selected_idx)
+                self.notify(
+                    'Could not load cached follow-ups; press R to refresh',
+                    severity='warning',
+                )
         switch_hint = self._session.get('_switch_hint')
         if switch_hint:
             self.notify(
@@ -2011,7 +2039,7 @@ class ReviewApp(LoreNodeShutdownMixin, CheckRunnerMixin, App[None]):
             mark_outgoing_seen([msg])
             self.notify(f'Reply sent to {entry["fromemail"]}')
 
-    def _load_followup_msgs(self, msgs: List[Any]) -> None:
+    def _load_followup_msgs(self, msgs: List[Any], *, cached: bool = False) -> None:
         """Parse msgs into follow-up comments and refresh the display."""
         cover_msgid = self._series.get('header-info', {}).get('msgid')
 
@@ -2098,7 +2126,9 @@ class ReviewApp(LoreNodeShutdownMixin, CheckRunnerMixin, App[None]):
             fc_list.sort(key=lambda e: e['date'])
 
         # Extract inline diff comments from follow-ups that quote patches
-        inline_count = self._integrate_followup_inline(self._followup_comments)
+        inline_count = (
+            0 if cached else self._integrate_followup_inline(self._followup_comments)
+        )
 
         # Count stored external inline comments (sashiko, agents)
         my_email = str(self._usercfg.get('email', ''))
@@ -2116,10 +2146,11 @@ class ReviewApp(LoreNodeShutdownMixin, CheckRunnerMixin, App[None]):
             parts.append(f'{inline_count} inline comment(s)')
         if ext_count:
             parts.append(f'{ext_count} external review comment(s)')
+        suffix = ' (cached; press R to refresh)' if cached else ''
         if parts:
-            self.notify(f'Loaded {", ".join(parts)}')
+            self.notify(f'Loaded {", ".join(parts)}{suffix}')
         else:
-            self.notify('No follow-up comments found')
+            self.notify(f'No follow-up comments found{suffix}')
         self._populate_patch_list()
         self._show_content(self._selected_idx)
 
@@ -2195,9 +2226,9 @@ class ReviewApp(LoreNodeShutdownMixin, CheckRunnerMixin, App[None]):
 
     def action_followups(self) -> None:
         """Toggle follow-up comments on/off."""
-        self._followup_generation += 1
         # ── Toggle off ────────────────────────────────────────────────────────
         if self._show_external_comments:
+            self._followup_generation += 1
             self._show_external_comments = False
             self._followup_comments = {}
             self._followup_positions = {}
@@ -2205,6 +2236,11 @@ class ReviewApp(LoreNodeShutdownMixin, CheckRunnerMixin, App[None]):
             self._show_content(self._selected_idx)
             return
 
+        self.action_refresh_followups()
+
+    def action_refresh_followups(self) -> None:
+        """Refresh follow-up comments from Lore."""
+        self._followup_generation += 1
         cover_msgid = self._series.get('header-info', {}).get('msgid')
         if not cover_msgid:
             self.notify('No message-id for cover letter', severity='error')
@@ -2240,7 +2276,12 @@ class ReviewApp(LoreNodeShutdownMixin, CheckRunnerMixin, App[None]):
         if blob_sha:
             mbox_bytes = b4.review.tracking.get_thread_mbox(self._topdir, blob_sha)
             if mbox_bytes is not None and mbox_bytes:
-                return liblore.utils.split_mbox(mbox_bytes) or None
+                msgs = [
+                    msg
+                    for msg in liblore.utils.split_mbox(mbox_bytes)
+                    if b4.LoreMessage.get_clean_msgid(msg)
+                ]
+                return msgs or None
         return None
 
     def _fetch_rethreaded_threads(
