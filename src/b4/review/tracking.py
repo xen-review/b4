@@ -2799,6 +2799,7 @@ def _parse_msgs_to_followup_comments(
     Returns Dict[display_idx -> List[{body, fromname, fromemail, date}]].
     display_idx 0 = cover letter, 1..N = patches.
     """
+    msgs = [msg for msg in msgs if b4.LoreMessage.get_clean_msgid(msg)]
     minimised = b4.mbox.minimize_thread(list(msgs))
     minimised_body_map: Dict[str, str] = {}
     for mmsg in minimised:

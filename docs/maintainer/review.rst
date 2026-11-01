@@ -434,6 +434,7 @@ Key                        Action
 ``n``                      Notes — view or edit review notes
 ``f``                      Followups — toggle follow-up messages and external
                            inline comments from lore
+``R``                      Refresh follow-ups from lore
 ``F``                      Toggle threaded follow-up list
 ``a``                      Agent — run review LLM agent (if configured)
 ``d``                      Done — toggle "done" state on the current patch
@@ -543,12 +544,13 @@ in the diff view. These sources include:
   service (when :term:`b4.sashiko-url` is configured).
 * **Review agents** — AI review agents invoked with ``a``.
 
-External inline comments are only displayed when follow-ups are active
-— press ``f`` to toggle them on. Your own comments are always visible
-regardless of the ``f`` state. When external comments are hidden, the
-diff view shows a ``≡`` gutter marker in the left margin on lines that
-have external comments, so you can see at a glance where reviewers have
-commented without loading the full panels.
+External inline comments are displayed when follow-ups are active.
+Cached follow-ups are shown on entry; press ``f`` to toggle them. Your
+own comments are always visible regardless of the ``f`` state. When
+external comments are hidden, the diff view shows a ``≡`` gutter marker
+in the left margin on lines that have external comments, so you can see
+at a glance where reviewers have commented without loading the full
+panels.
 
 Each reviewer's comments are displayed in a distinct colour (green is
 excluded from the palette to avoid blending with diff additions). The
@@ -795,18 +797,19 @@ in the patch selection dialog.
 
 **Follow-up messages**
 
-Press ``f`` to load and display follow-up messages for the series being
-reviewed. B4 fetches the latest thread from lore in the background and
-updates the cached thread stored as a git blob in the review branch. If
-the fetch fails, it displays any available cached messages and warns
-that the follow-ups may be incomplete or out of date. The ``f`` key is a
-toggle — pressing it again hides the follow-up display; toggle it back on
-to refresh the thread again.
+When a cached thread is available as a git blob in the review branch, b4
+displays its follow-up messages on entry without fetching from lore. The
+cache may be incomplete or out of date. Press ``R`` to fetch the latest
+thread in the background and update the cache. If the fetch fails, b4
+displays any available cached messages and warns that follow-ups may be
+missing or out of date. The ``f`` key toggles the follow-up display off;
+toggle it back on to refresh the thread again. When no cached thread is
+available, ``f`` also loads the follow-ups from lore.
 
 The sidebar shows follow-ups as a threaded list by default. Press ``F``
 to switch between this view and chronological order. In the threaded
-list, replies appear below their parent
-messages; indentation is compacted as needed when the sidebar narrows.
+list, replies appear below their parent messages; indentation is
+compacted as needed when the sidebar narrows.
 The selected message remains selected when switching views or resizing.
 
 Follow-up messages appear as coloured panels below the diff, showing
