@@ -83,6 +83,7 @@ from b4.review_tui._modals import (
     BaseSelectionScreen,
     CheckLoadingScreen,
     CherryPickScreen,
+    ConfirmScreen,
     HelpScreen,
     KeyDecisionScreen,
     LimitScreen,
@@ -1108,6 +1109,7 @@ class TrackingApp(LoreNodeShutdownMixin, CheckRunnerMixin, App[Optional[str]]):
         'thread': 'Series',
         'range_diff': 'Series',
         'action': 'Series',
+        'delete_series': 'Series',
         'update_one': 'Series',
         'target_branch': 'Series',
         'update_all': 'App',
@@ -1130,6 +1132,7 @@ class TrackingApp(LoreNodeShutdownMixin, CheckRunnerMixin, App[Optional[str]]):
         Binding('c', 'check', 'ci'),
         Binding('e', 'thread', 'thread'),
         Binding('a', 'action', 'action'),
+        Binding('delete', 'delete_series', 'delete'),
         Binding('u', 'update_one', 'update'),
         Binding('d', 'range_diff', 'range-diff'),
         # App-global actions
@@ -1683,6 +1686,8 @@ class TrackingApp(LoreNodeShutdownMixin, CheckRunnerMixin, App[Optional[str]]):
         if action == 'patchwork':
             return bool(self._pwkey and self._pwurl and self._pwproj)
         if action == 'action':
+            return self._selected_series is not None
+        if action == 'delete_series':
             return self._selected_series is not None
         if action == 'update_revision':
             # Upgrade availability is governed by has_newer alone — it is an
@@ -4106,6 +4111,130 @@ class TrackingApp(LoreNodeShutdownMixin, CheckRunnerMixin, App[Optional[str]]):
             self.notify(err, severity='error')
         return ok
 
+    def _find_unsent_edited_replies(self, review_branch: str) -> List[str]:
+        """Return cover/patch labels with saved, edited, unsent replies."""
+        topdir = b4.git_get_toplevel()
+        if not topdir:
+            raise RuntimeError('Not in a git repository')
+
+        cover_text, tracking = b4.review.load_tracking(topdir, review_branch)
+        series = tracking.get('series', {})
+        patches = tracking.get('patches', [])
+        my_email = str(b4.get_user_config().get('email', 'unknown@example.com'))
+
+        first_patch = series.get('first-patch-commit', '')
+        if first_patch:
+            range_spec = f'{first_patch}~1..{review_branch}~1'
+        else:
+            range_spec = f'{series.get("base-commit", "")}..{review_branch}~1'
+        ecode, out = b4.git_run_command(topdir, ['rev-list', '--reverse', range_spec])
+        if ecode != 0:
+            raise RuntimeError('Could not inspect review commits')
+        commit_shas = out.strip().splitlines() if out.strip() else []
+
+        targets: List[Tuple[Dict[str, Any], str, Optional[str]]] = [
+            (series, 'cover letter', None)
+        ]
+        targets.extend(
+            (patch, f'patch {index + 1}', commit_shas[index])
+            for index, patch in enumerate(patches)
+            if index < len(commit_shas)
+        )
+        edited: List[str] = []
+        for target, label, sha in targets:
+            review = target.get('reviews', {}).get(my_email, {})
+            reply = b4.review._normalize_line_endings(review.get('reply', ''))
+            if not reply or review.get('sent-revision') is not None:
+                continue
+
+            if sha is None:
+                generated = b4.review._render_quoted_diff_with_comments(
+                    '',
+                    target.get('reviews', {}),
+                    my_email,
+                    commit_msg=cover_text,
+                )
+            else:
+                ecode, diff_text = b4.git_run_command(
+                    topdir, ['diff', f'{sha}~1', sha, '--']
+                )
+                if ecode != 0:
+                    raise RuntimeError(f'Could not inspect {label} diff')
+                ecode, commit_msg = b4.git_run_command(
+                    topdir, ['show', '--format=%B', '--no-patch', sha, '--']
+                )
+                if ecode != 0:
+                    raise RuntimeError(f'Could not inspect {label} message')
+                generated = b4.review._render_quoted_diff_with_comments(
+                    diff_text,
+                    target.get('reviews', {}),
+                    my_email,
+                    commit_msg=commit_msg.strip(),
+                    basement=target.get('basement', ''),
+                )
+
+            if reply != b4.review._normalize_line_endings(generated):
+                edited.append(label)
+        return edited
+
+    def action_delete_series(self) -> None:
+        """Remove the selected series, confirming only for edited drafts."""
+        if not self._selected_series:
+            return
+        change_id = self._selected_series.get('change_id', '')
+        if not change_id:
+            return
+        review_branch = f'b4/review/{change_id}'
+        topdir = b4.git_get_toplevel()
+        has_branch = bool(topdir and b4.git_branch_exists(topdir, review_branch))
+        revision = self._selected_series.get('revision')
+        subject = self._selected_series.get('subject', '')
+
+        edited_replies: List[str] = []
+        if has_branch:
+            try:
+                edited_replies = self._find_unsent_edited_replies(review_branch)
+            except (Exception, SystemExit) as ex:
+                self.notify(f'Could not check saved replies: {ex}', severity='error')
+                return
+
+        if edited_replies:
+            locations = ', '.join(edited_replies)
+            screen = ConfirmScreen(
+                title='Remove Series',
+                body=[
+                    f'Edited, unsent reply saved for: {locations}.',
+                    'Removing this series deletes its review branch and drafts.',
+                    'Tracking data will be removed from the database.',
+                    '',
+                    'Remove anyway?',
+                ],
+                border='$error',
+                title_colour='$error',
+                subject=subject,
+            )
+            self.push_screen(
+                screen,
+                callback=lambda confirmed: self._on_abandon_confirmed(
+                    confirmed,
+                    change_id,
+                    review_branch,
+                    has_branch,
+                    revision=revision,
+                    success_verb='Removed',
+                ),
+            )
+            return
+
+        self._on_abandon_confirmed(
+            True,
+            change_id,
+            review_branch,
+            has_branch,
+            revision=revision,
+            success_verb='Removed',
+        )
+
     def action_abandon(self) -> None:
         """Abandon the selected series."""
         if not self._selected_series:
@@ -4133,6 +4262,7 @@ class TrackingApp(LoreNodeShutdownMixin, CheckRunnerMixin, App[Optional[str]]):
         review_branch: str,
         has_branch: bool,
         revision: Optional[int] = None,
+        success_verb: str = 'Abandoned',
     ) -> None:
         if not confirmed:
             return
@@ -4151,7 +4281,7 @@ class TrackingApp(LoreNodeShutdownMixin, CheckRunnerMixin, App[Optional[str]]):
         except Exception as ex:
             self.notify(f'DB error: {ex}', severity='error')
             return
-        self.notify(f'Abandoned {change_id}')
+        self.notify(f'{success_verb} {change_id}')
         self._selected_series = None
         panel = self.query_one('#details-panel', Vertical)
         panel.styles.height = 0
