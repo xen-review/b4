@@ -1163,6 +1163,182 @@ class TestTrackingUpgradeGating:
             assert row[0] == 2
 
 
+class TestTrackingDelete:
+    @pytest.mark.asyncio
+    async def test_delete_clean_series_without_confirmation(self, gitdir: str) -> None:
+        identifier = 'test-delete-clean'
+        change_id = 'delete-clean-1'
+        branch = create_review_branch(gitdir, change_id, identifier=identifier)
+        seed_db(
+            identifier,
+            [
+                {
+                    'change_id': change_id,
+                    'subject': '[PATCH] delete clean series',
+                    'status': 'reviewing',
+                    'message_id': 'delete-clean@ex.com',
+                }
+            ],
+        )
+
+        app = TrackingApp(identifier)
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            await pilot.press('delete')
+            await pilot.pause()
+
+            assert not isinstance(app.screen, ConfirmScreen)
+            assert not b4.git_branch_exists(gitdir, branch)
+            conn = tracking.get_db(identifier)
+            row = conn.execute(
+                'SELECT change_id FROM series WHERE change_id = ?', (change_id,)
+            ).fetchone()
+            conn.close()
+            assert row is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('target_name', ['cover letter', 'patch 1'])
+    async def test_delete_edited_reply_requires_confirmation(
+        self, gitdir: str, target_name: str
+    ) -> None:
+        identifier = f'test-delete-draft-{target_name.replace(" ", "-")}'
+        change_id = 'delete-draft-1'
+        branch = create_review_branch(
+            gitdir, change_id, identifier=identifier, patch_messages=['patch 1']
+        )
+        cover, review_tracking = b4.review.load_tracking(gitdir, branch)
+        target = (
+            review_tracking['series']
+            if target_name == 'cover letter'
+            else review_tracking['patches'][0]
+        )
+        my_email = str(b4.get_user_config().get('email', 'unknown@example.com'))
+        target['reviews'] = {my_email: {'reply': 'An edited, unsent reply.'}}
+        assert b4.review.save_tracking_ref(gitdir, branch, cover, review_tracking)
+        seed_db(
+            identifier,
+            [
+                {
+                    'change_id': change_id,
+                    'subject': '[PATCH] delete draft series',
+                    'status': 'reviewing',
+                    'message_id': 'delete-draft@ex.com',
+                }
+            ],
+        )
+
+        app = TrackingApp(identifier)
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            await pilot.press('delete')
+            await pilot.pause()
+
+            assert isinstance(app.screen, ConfirmScreen)
+            assert any(target_name in line for line in app.screen._body)
+            assert b4.git_branch_exists(gitdir, branch)
+
+            await pilot.press('escape')
+            await pilot.pause()
+            assert b4.git_branch_exists(gitdir, branch)
+            assert _get_db_status(identifier, change_id) == 'reviewing'
+
+            await pilot.press('delete')
+            await pilot.pause()
+            assert isinstance(app.screen, ConfirmScreen)
+            await pilot.press('y')
+            await pilot.pause()
+            assert not b4.git_branch_exists(gitdir, branch)
+            conn = tracking.get_db(identifier)
+            row = conn.execute(
+                'SELECT change_id FROM series WHERE change_id = ?', (change_id,)
+            ).fetchone()
+            conn.close()
+            assert row is None
+
+    @pytest.mark.asyncio
+    async def test_delete_generated_reply_without_confirmation(
+        self, gitdir: str
+    ) -> None:
+        identifier = 'test-delete-generated'
+        change_id = 'delete-generated-1'
+        branch = create_review_branch(
+            gitdir, change_id, identifier=identifier, patch_messages=['patch 1']
+        )
+        cover, review_tracking = b4.review.load_tracking(gitdir, branch)
+        my_email = str(b4.get_user_config().get('email', 'unknown@example.com'))
+        target = review_tracking['patches'][0]
+        target['reviews'] = {my_email: {'name': str(b4.get_user_config()['name'])}}
+        sha = branch.patch_shas[0]
+        ecode, diff_text = b4.git_run_command(gitdir, ['diff', f'{sha}~1', sha, '--'])
+        assert ecode == 0
+        ecode, commit_msg = b4.git_run_command(
+            gitdir, ['show', '--format=%B', '--no-patch', sha, '--']
+        )
+        assert ecode == 0
+        target['reviews'][my_email]['reply'] = (
+            b4.review._render_quoted_diff_with_comments(
+                diff_text,
+                target['reviews'],
+                my_email,
+                commit_msg=commit_msg.strip(),
+                basement=target.get('basement', ''),
+            )
+        )
+        assert b4.review.save_tracking_ref(gitdir, branch, cover, review_tracking)
+        seed_db(
+            identifier,
+            [
+                {
+                    'change_id': change_id,
+                    'subject': '[PATCH] delete generated reply',
+                    'status': 'reviewing',
+                    'message_id': 'delete-generated@ex.com',
+                }
+            ],
+        )
+
+        app = TrackingApp(identifier)
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            await pilot.press('delete')
+            await pilot.pause()
+            assert not isinstance(app.screen, ConfirmScreen)
+            assert not b4.git_branch_exists(gitdir, branch)
+
+    @pytest.mark.asyncio
+    async def test_delete_sent_reply_without_confirmation(self, gitdir: str) -> None:
+        identifier = 'test-delete-sent'
+        change_id = 'delete-sent-1'
+        branch = create_review_branch(
+            gitdir, change_id, identifier=identifier, patch_messages=['patch 1']
+        )
+        cover, review_tracking = b4.review.load_tracking(gitdir, branch)
+        my_email = str(b4.get_user_config().get('email', 'unknown@example.com'))
+        review_tracking['series']['reviews'] = {
+            my_email: {'reply': 'Already sent.', 'sent-revision': 1}
+        }
+        assert b4.review.save_tracking_ref(gitdir, branch, cover, review_tracking)
+        seed_db(
+            identifier,
+            [
+                {
+                    'change_id': change_id,
+                    'subject': '[PATCH] delete sent reply',
+                    'status': 'replied',
+                    'message_id': 'delete-sent@ex.com',
+                }
+            ],
+        )
+
+        app = TrackingApp(identifier)
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            await pilot.press('delete')
+            await pilot.pause()
+            assert not isinstance(app.screen, ConfirmScreen)
+            assert not b4.git_branch_exists(gitdir, branch)
+
+
 class TestTrackingAbandon:
     """Tests for the abandon workflow."""
 

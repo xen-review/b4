@@ -206,9 +206,14 @@ Key           Action
               only when the queue is non-empty; see
               :ref:`queuing thanks <thanks_queue>`)
 ``j``/``k``   Move cursor down/up
+``Delete``    Remove the selected series and review branch from b4
 ``?``         Help — show keybinding reference
 ``Q``         Quit
 ============  ===========================================================
+
+Deleting a series removes its tracking records and local review branch.
+If the branch contains an edited, unsent reply for the cover letter or
+one of its patches, b4 asks for confirmation before deleting those drafts.
 
 Quitting takes a capital ``Q`` in all b4 TUI apps (tracking list,
 review interface, Patchwork browser, and ``b4 bugs``). Bare ``q``
