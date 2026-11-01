@@ -1123,7 +1123,7 @@ class TrackingApp(LoreNodeShutdownMixin, CheckRunnerMixin, App[Optional[str]]):
         # Hidden navigation bindings
         Binding('j', 'cursor_down', 'Down', show=False),
         Binding('k', 'cursor_up', 'Up', show=False),
-        Binding('escape', 'hide_details', 'Close', show=False),
+        Binding('escape', 'quit', 'quit', show=False),
         # Series-specific actions
         Binding('r', 'review', 'review'),
         Binding('t', 'target_branch', 'target'),

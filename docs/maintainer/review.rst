@@ -207,7 +207,7 @@ Key           Action
               :ref:`queuing thanks <thanks_queue>`)
 ``j``/``k``   Move cursor down/up
 ``?``         Help — show keybinding reference
-``Q``         Quit
+``Q``/``Esc`` Quit
 ============  ===========================================================
 
 Quitting takes a capital ``Q`` in all b4 TUI apps (tracking list,
@@ -445,7 +445,7 @@ Key                        Action
 ``e``                      Toggle email mode
 ``s``                      Shell — suspend to an interactive sub-shell
 ``?``                      Help — show keybinding reference
-``Q``                      Quit (bare ``q`` only shows a reminder)
+``Q``/``Escape``           Quit (bare ``q`` only shows a reminder)
 =========================  =============================================
 
 **Email preview mode keybindings**

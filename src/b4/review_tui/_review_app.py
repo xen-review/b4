@@ -281,6 +281,7 @@ class ReviewApp(LoreNodeShutdownMixin, CheckRunnerMixin, App[None]):
         Binding('e', 'toggle_preview', 'email mode'),
         Binding('s', 'suspend', 'shell'),
         *QUIT_BINDINGS,
+        Binding('escape', 'back', 'back', show=False),
         Binding('question_mark', 'help', 'help', key_display='?'),
         Binding('tab', 'focus_next', 'Tab', show=False),
         Binding('space', 'page_down', 'Page down', show=False),
@@ -2695,6 +2696,13 @@ class ReviewApp(LoreNodeShutdownMixin, CheckRunnerMixin, App[None]):
 
     async def action_quit(self) -> None:
         """Quit the TUI."""
+        self.exit()
+
+    async def action_back(self) -> None:
+        """Return to the patch list or leave the review."""
+        if self._preview_mode and self.query_one('#diff-viewer').has_focus:
+            self.query_one('#patch-list', ListView).focus()
+            return
         self.exit()
 
     def action_quit_hint(self) -> None:

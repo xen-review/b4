@@ -594,6 +594,19 @@ class TestTrackingQuit:
     """Tests for quitting the app."""
 
     @pytest.mark.asyncio
+    async def test_escape_exits_tracking_list(self, tmp_path: pathlib.Path) -> None:
+        seed_db('test-escape-quit', SAMPLE_SERIES)
+
+        app = TrackingApp('test-escape-quit')
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            assert app.is_running
+
+            await pilot.press('escape')
+            await pilot.pause()
+            assert not app.is_running
+
+    @pytest.mark.asyncio
     async def test_q_warns_and_capital_q_exits(self, tmp_path: pathlib.Path) -> None:
         seed_db('test-quit', SAMPLE_SERIES)
 
@@ -1554,7 +1567,7 @@ class TestTrackingDetailPanel:
 
     @pytest.mark.asyncio
     async def test_detail_panel_lifecycle(self, tmp_path: pathlib.Path) -> None:
-        """The panel auto-shows, follows navigation, and hides on escape."""
+        """The panel auto-shows, follows navigation, then Escape quits."""
         seed_db('test-detail', SAMPLE_SERIES)
 
         app = TrackingApp('test-detail')
@@ -1590,11 +1603,10 @@ class TestTrackingDetailPanel:
             assert app._selected_series is not None
             assert 'alpha' in app._selected_series.get('subject', '')
 
-            # Escape hides the panel
+            # Escape returns from the tracking list to the caller
             await pilot.press('escape')
             await pilot.pause()
-            assert panel.styles.height is not None
-            assert panel.styles.height.value == 0
+            assert not app.is_running
 
 
 class TestTrackingMultipleSeries:

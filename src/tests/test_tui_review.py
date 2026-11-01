@@ -1573,6 +1573,34 @@ class TestEditorFailure:
 class TestBranchRestore:
     """b4 only puts back a branch it moved itself."""
 
+    @pytest.mark.asyncio
+    async def test_escape_moves_left_from_email_pane_then_returns_to_tracking(
+        self, gitdir: str
+    ) -> None:
+        branch, _shas = _create_review_branch_with_patches(
+            gitdir, 'escape-review', ['patch 1']
+        )
+        app = ReviewApp(_build_session(gitdir, branch))
+
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            await pilot.press('e')
+            await pilot.pause()
+            right_pane = app.query_one('#diff-viewer')
+            left_pane = app.query_one('#patch-list', ListView)
+            right_pane.focus()
+            await pilot.pause()
+            assert right_pane.has_focus
+
+            await pilot.press('escape')
+            await pilot.pause()
+            assert left_pane.has_focus
+            assert app.is_running
+
+            await pilot.press('escape')
+            await pilot.pause()
+            assert not app.is_running
+
     def test_restore_skips_a_checkout_b4_did_not_make(self, gitdir: str) -> None:
         """The worktree the TUI runs in is shared with the user's other
         terminals; a branch they switched to there is not ours to undo."""
