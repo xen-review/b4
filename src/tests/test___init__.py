@@ -1816,6 +1816,25 @@ class TestDeprecatedConfig:
         assert 'searchmask' not in caplog.text
 
 
+class TestProjectUpstreamConfig:
+    def test_upstream_repo_is_allowed_from_project_config(self, gitdir: str) -> None:
+        wtcfg = pathlib.Path(gitdir) / '.b4-config'
+        wtcfg.write_text(
+            '[b4]\n'
+            '  upstream-repo = https://github.com/xen-project/xen.git\n'
+            '  upstream-branch = staging\n'
+            '  untrusted-option = ignored\n'
+        )
+
+        b4._setup_main_config(topdir=gitdir)
+
+        assert b4.get_main_config()['upstream-repo'] == (
+            'https://github.com/xen-project/xen.git'
+        )
+        assert b4.get_main_config()['upstream-branch'] == 'staging'
+        assert 'untrusted-option' not in b4.get_main_config()
+
+
 class _FakeClock:
     """Stands in for the time module inside dns.resolver."""
 

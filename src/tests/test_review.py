@@ -4584,6 +4584,173 @@ def test_update_all_tracking_skips_snoozed_and_archived(
     assert result['cancelled'] is False
 
 
+def test_update_all_tracking_fetches_upstream_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from b4.review import _review
+
+    series = [
+        {
+            'change_id': 'a',
+            'subject': 's-a',
+            'status': 'new',
+            'sender_name': 'A',
+            'sent_at': '2026-03-01T00:00:00+00:00',
+        },
+        {
+            'change_id': 'b',
+            'subject': 's-b',
+            'status': 'new',
+            'sender_name': 'B',
+            'sent_at': '2026-04-01T00:00:00+00:00',
+        },
+    ]
+    monkeypatch.setattr(
+        b4.review.tracking, 'rescan_branches', lambda identifier, topdir: {}
+    )
+    monkeypatch.setattr(_review, '_resolve_upstream_repository', lambda *args: 'repo')
+    monkeypatch.setattr(_review, '_resolve_upstream_branch', lambda *args: 'staging')
+    upstream = {'subject': [_review.UpstreamCommit('commit-id', 'Author', 'a@b', 1)]}
+    fetch = mock.Mock(return_value=upstream)
+    monkeypatch.setattr(_review, '_fetch_upstream_commits', fetch)
+    seen = []
+
+    def fake_update(
+        one: Dict[str, Any],
+        identifier: str,
+        linkmask: str,
+        topdir: Optional[str] = None,
+        upstream_commits: Optional[Dict[str, List[_review.UpstreamCommit]]] = None,
+    ) -> Dict[str, Any]:
+        seen.append(upstream_commits)
+        return {
+            'new_revisions': 0,
+            'new_trailers': 0,
+            'error': None,
+            'merged_patches': 1,
+        }
+
+    monkeypatch.setattr(review, 'update_series_tracking', fake_update)
+    result = review.update_all_tracking(
+        'upstream-sweep',
+        'https://lore.example/r/%s',
+        topdir='/repo',
+        series_list=series,
+        upstream_repo='configured-upstream',
+        upstream_branch='staging',
+    )
+
+    fetch.assert_called_once_with('/repo', 'repo', '2025-03-01', 'staging')
+    assert seen == [upstream, upstream]
+    assert result['merged_patches'] == 2
+
+
+def test_resolve_upstream_branch_uses_repo_tracking_branch(gitdir: str) -> None:
+    ecode, _out = b4.git_run_command(gitdir, ['remote', 'add', 'upstream', gitdir])
+    assert ecode == 0
+    ecode, _out = b4.git_run_command(
+        gitdir, ['update-ref', 'refs/remotes/upstream/staging', 'HEAD']
+    )
+    assert ecode == 0
+
+    assert _review._resolve_upstream_branch(gitdir, None) == 'staging'
+
+
+def test_update_all_tracking_continues_when_upstream_fetch_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    series = [
+        {'change_id': 'a', 'subject': 's-a', 'status': 'new', 'sender_name': 'A'}
+    ]
+    monkeypatch.setattr(
+        b4.review.tracking, 'rescan_branches', lambda identifier, topdir: {}
+    )
+    from b4.review import _review
+
+    monkeypatch.setattr(
+        _review,
+        '_resolve_upstream_repository',
+        mock.Mock(side_effect=RuntimeError('upstream offline')),
+    )
+    updates = []
+
+    def fake_update(
+        one: Dict[str, Any],
+        identifier: str,
+        linkmask: str,
+        topdir: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        updates.append(one['change_id'])
+        return {'new_revisions': 0, 'new_trailers': 0, 'error': None}
+
+    monkeypatch.setattr(review, 'update_series_tracking', fake_update)
+    result = review.update_all_tracking(
+        'upstream-offline',
+        'https://lore.example/r/%s',
+        topdir='/repo',
+        series_list=series,
+    )
+
+    assert updates == ['a']
+    assert result['upstream_merge_error'] == 'upstream offline'
+    assert result['series_checked'] == 1
+
+
+def test_resolve_upstream_repository_prefers_configured_remote(gitdir: str) -> None:
+    remote_url = 'https://example.com/project/upstream.git'
+    ecode, _out = b4.git_run_command(
+        gitdir, ['remote', 'add', 'project-upstream', remote_url]
+    )
+    assert ecode == 0
+
+    assert (
+        _review._resolve_upstream_repository(gitdir, 'project-upstream') == remote_url
+    )
+
+
+def test_resolve_upstream_repository_uses_upstream_remote(gitdir: str) -> None:
+    remote_url = 'https://example.com/project/upstream.git'
+    ecode, _out = b4.git_run_command(gitdir, ['remote', 'add', 'upstream', remote_url])
+    assert ecode == 0
+
+    assert _review._resolve_upstream_repository(gitdir, None) == remote_url
+
+
+def test_resolve_upstream_repository_discovers_github_parent(gitdir: str) -> None:
+    b4.git_run_command(gitdir, ['remote', 'remove', 'origin'])
+    ecode, _out = b4.git_run_command(
+        gitdir, ['remote', 'add', 'origin', 'git@github.com:fork/project.git']
+    )
+    assert ecode == 0
+    response = mock.Mock()
+    response.json.return_value = {'parent': {'full_name': 'project-org/project'}}
+
+    with mock.patch.object(
+        b4,
+        'get_requests_session',
+        return_value=mock.Mock(get=mock.Mock(return_value=response)),
+    ) as get_session:
+        repository = _review._resolve_upstream_repository(gitdir, None)
+
+    assert repository == 'https://github.com/project-org/project.git'
+    get_session.return_value.get.assert_called_once_with(
+        'https://api.github.com/repos/fork/project', timeout=(3, 10)
+    )
+
+
+def test_resolve_upstream_repository_uses_non_fork_github_origin(gitdir: str) -> None:
+    origin = 'git@github.com:project-org/project.git'
+    b4.git_run_command(gitdir, ['remote', 'remove', 'origin'])
+    ecode, _out = b4.git_run_command(gitdir, ['remote', 'add', 'origin', origin])
+    assert ecode == 0
+    response = mock.Mock()
+    response.json.return_value = {'parent': None}
+    with mock.patch.object(
+        b4, 'get_requests_session', return_value=mock.Mock(get=mock.Mock(return_value=response))
+    ):
+        assert _review._resolve_upstream_repository(gitdir, None) == origin
+
+
 def test_update_all_tracking_counts_upstream(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
