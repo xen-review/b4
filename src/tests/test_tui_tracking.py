@@ -5498,6 +5498,64 @@ class TestListAlignment:
         assert '[v1,0/1]' in plain
         assert '→' not in plain
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'status, merged_count',
+        [('reviewing', 1), ('merged', 2)],
+    )
+    async def test_merged_status_uses_violet_check_in_status_column(
+        self,
+        tmp_path: pathlib.Path,
+        status: str,
+        merged_count: int,
+    ) -> None:
+        seed_db(
+            'test-merged-badge',
+            [
+                {
+                    'change_id': 'merged-badge',
+                    'subject': '[PATCH 0/2] merged badge',
+                    'message_id': 'merged-badge@example.com',
+                    'num_patches': 2,
+                    'status': status,
+                }
+            ],
+        )
+        conn = tracking.get_db('test-merged-badge')
+        conn.execute(
+            'UPDATE series SET attestation = ? WHERE change_id = ?',
+            ('signed:DKIM/example.org', 'merged-badge'),
+        )
+        conn.commit()
+        conn.close()
+        app = TrackingApp('test-merged-badge')
+
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            lv = app.query_one('#tracking-list', ListView)
+            item = next(
+                child for child in lv.children if isinstance(child, TrackedSeriesItem)
+            )
+            item.series['merged_patch_count'] = merged_count
+            item.series['merged_patch_positions'] = list(range(1, merged_count + 1))
+            text = item.render_label()
+            check_spans = [
+                span for span in text.spans if text.plain[span.start : span.end] == '✔'
+            ]
+            assert check_spans[0].style != '#a855f7'
+            if status == 'merged':
+                assert check_spans[1].style == '#a855f7'
+                assert check_spans[1].start > check_spans[0].start
+            else:
+                assert len(check_spans) == 1
+            app._show_details(item.series)
+            expected = (
+                'patch 1 of 2 merged upstream'
+                if merged_count == 1
+                else 'patches 1, 2 of 2 merged upstream'
+            )
+            assert str(static_text(app.query_one('#detail-merged', Static))) == expected
+
 
 class TestAttestationPasses:
     """The A column ignores unverifiable attestations, not failing ones."""

@@ -17,6 +17,7 @@ pytest.importorskip('textual')
 import b4
 import b4.review
 import liblore
+from b4.review import _review
 from b4.review import checks as review_checks
 from b4.review import messages as review_messages
 from b4.review import tracking as review_tracking
@@ -72,6 +73,43 @@ class TestDbOperations:
         version = cursor.fetchone()[0]
         assert version == review_tracking.SCHEMA_VERSION
         conn.close()
+
+    def test_get_db_migrates_patch_merge_columns(
+        self, tmp_path: pytest.TempPathFactory
+    ) -> None:
+        conn = sqlite3.connect(
+            review_tracking.get_db_path('patch-merge-migration-test')
+        )
+        conn.executescript(
+            """
+            CREATE TABLE schema_version (version INTEGER PRIMARY KEY);
+            INSERT INTO schema_version VALUES (10);
+            CREATE TABLE series_patches (
+                change_id TEXT NOT NULL,
+                revision INTEGER NOT NULL,
+                position INTEGER NOT NULL,
+                message_id TEXT NOT NULL,
+                subject TEXT,
+                PRIMARY KEY (change_id, revision, position)
+            );
+            """
+        )
+        conn.execute(
+            'INSERT INTO series_patches VALUES (?, ?, ?, ?, ?)',
+            ('change-merge', 1, 1, 'patch@example.com', 'patch subject'),
+        )
+        conn.commit()
+        conn.close()
+
+        conn = review_tracking.get_db('patch-merge-migration-test')
+        columns = {row[1] for row in conn.execute('PRAGMA table_info(series_patches)')}
+        version = conn.execute('SELECT version FROM schema_version').fetchone()[0]
+        patch = review_tracking.get_series_patches(conn, 'change-merge', 1)[0]
+        conn.close()
+        assert {'patch_id', 'merged_commit'} <= columns
+        assert version == review_tracking.SCHEMA_VERSION
+        assert patch['message_id'] == 'patch@example.com'
+        assert patch['merged_commit'] is None
 
     def test_db_exists(self, tmp_path: pytest.TempPathFactory) -> None:
         """Verify db_exists returns correct values."""
@@ -318,6 +356,43 @@ class TestDbOperations:
         assert result[0]['status'] == 'new'
         assert result[1]['subject'] == 'First series'
         assert result[1]['revision'] == 1
+
+    def test_get_all_tracked_series_includes_merged_patch_count(
+        self, tmp_path: pytest.TempPathFactory
+    ) -> None:
+        conn = review_tracking.init_db('all-series-merged-test')
+        review_tracking.add_series_to_db(
+            conn,
+            'change-merged',
+            1,
+            'Merged series',
+            'Author',
+            'author@example.com',
+            '2024-01-15T10:00:00+00:00',
+            'merged@example.com',
+            2,
+        )
+        _insert_patches(
+            conn,
+            'change-merged',
+            1,
+            ['patch-1@example.com', 'patch-2@example.com'],
+        )
+        review_tracking.set_series_patch_merge_status(
+            conn,
+            'change-merged',
+            1,
+            {
+                1: ('patch-id-1', 'upstream-commit-1'),
+                2: ('patch-id-2', None),
+            },
+        )
+        conn.close()
+
+        series = review_tracking.get_all_tracked_series('all-series-merged-test')
+
+        assert series[0]['merged_patch_positions'] == [1]
+        assert series[0]['merged_patch_count'] == 1
 
     def test_queries_against_nonexistent_db(
         self, tmp_path: pytest.TempPathFactory
@@ -1080,6 +1155,72 @@ class TestRevisions:
         assert review_tracking.get_all_revision_counts(conn) == {}
         assert review_tracking.get_all_revisions_grouped(conn) == {}
         conn.close()
+
+    def test_patch_merge_status_is_refreshed_per_position(
+        self, tmp_path: pytest.TempPathFactory
+    ) -> None:
+        conn = review_tracking.init_db('rev-patch-merge-test')
+        _insert_patches(
+            conn,
+            'change-merge',
+            1,
+            ['patch-1@example.com', 'patch-2@example.com'],
+        )
+
+        review_tracking.set_series_patch_merge_status(
+            conn,
+            'change-merge',
+            1,
+            {
+                1: ('patch-id-1', 'upstream-commit-1'),
+                2: ('patch-id-2', None),
+            },
+        )
+        patches = review_tracking.get_series_patches(conn, 'change-merge', 1)
+        assert [p['merged_commit'] for p in patches] == [
+            'upstream-commit-1',
+            None,
+        ]
+
+        review_tracking.set_series_patch_merge_status(
+            conn,
+            'change-merge',
+            1,
+            {
+                1: ('patch-id-1', None),
+                2: ('patch-id-2', 'upstream-commit-2'),
+            },
+        )
+        patches = review_tracking.get_series_patches(conn, 'change-merge', 1)
+        conn.close()
+        assert [p['merged_commit'] for p in patches] == [
+            None,
+            'upstream-commit-2',
+        ]
+
+    def test_upstream_fetch_maps_subjects_to_commits(self, gitdir: str) -> None:
+        from b4.review import _review
+
+        branch = create_review_branch(
+            gitdir, 'upstream-merge-detection', with_patch=True
+        )
+        subject = 'upstream-merge-detection: tweak file1'
+        ecode, _out = b4.git_run_command(
+            gitdir, ['symbolic-ref', 'HEAD', f'refs/heads/{branch}']
+        )
+        assert ecode == 0
+        matches = _review._fetch_upstream_commits(gitdir, gitdir, '1970-01-01')
+        assert matches[subject][0].commit == branch.patch_shas[0]
+        assert matches[subject][0].author_email
+        assert matches[subject][0].committed_at > 0
+
+        ecode, _out = b4.git_run_command(
+            gitdir,
+            ['update-ref', f'refs/heads/{branch}', branch.base_sha],
+        )
+        assert ecode == 0
+        matches = _review._fetch_upstream_commits(gitdir, gitdir, '1970-01-01')
+        assert subject not in matches
 
     def test_get_all_newest_revisions(self, tmp_path: pytest.TempPathFactory) -> None:
         """Verify bulk newest-revision query returns all change_ids."""
@@ -2738,6 +2879,315 @@ class TestUpdateSeriesTrackingCounts:
         # Count refreshed, seen untouched — the badge shows (2)
         assert row['message_count'] == 7
         assert row['seen_message_count'] == 5
+
+    @pytest.mark.parametrize('matched_positions', [[1], [2], [3], [1, 3], [1, 2]])
+    def test_update_records_which_lore_patches_are_upstream(
+        self,
+        matched_positions: List[int],
+    ) -> None:
+        identifier = 'merged-patch-update-test'
+        change_id = 'merged-patch-update'
+        msgs = _series_msgs(change_id, AUTHOR, 1, 3, cover=True)
+        lmbx = b4.LoreMailbox()
+        for msg in msgs:
+            lmbx.add_message(msg)
+        lser = lmbx.get_series(1)
+        assert lser is not None
+
+        conn = review_tracking.init_db(identifier)
+        review_tracking.add_series_to_db(
+            conn,
+            change_id,
+            1,
+            'Merged patch test',
+            'Author',
+            'author@example.com',
+            '2026-03-19T00:00:00+00:00',
+            'merged-patch-update-p0@example.com',
+            3,
+        )
+        review_tracking.add_series_patches(conn, change_id, 1, lser)
+        conn.close()
+
+        upstream = {
+            patch.subject: [
+                _review.UpstreamCommit(
+                    f'upstream-{position}',
+                    patch.fromname,
+                    patch.fromemail,
+                    int(patch.date.timestamp()) + 3600,
+                )
+            ]
+            for position, patch in enumerate(lser.patches[1:], 1)
+            if patch is not None and position in matched_positions
+        }
+        series = {
+            'change_id': change_id,
+            'revision': 1,
+            'status': 'new',
+            'message_id': 'merged-patch-update-p0@example.com',
+        }
+        with (
+            mock.patch('b4.can_network', False),
+            mock.patch('b4.review._review.retrieve_series_messages', return_value=msgs),
+            mock.patch('b4.review._review.check_series_attestation', return_value=None),
+        ):
+            result = b4.review.update_series_tracking(
+                series,
+                identifier,
+                'https://example.com/%s',
+                upstream_commits=upstream,
+            )
+
+        conn = review_tracking.get_db(identifier)
+        patches = review_tracking.get_series_patches(conn, change_id, 1)
+        rows = conn.execute(
+            'SELECT status FROM series WHERE change_id = ? AND revision = ?',
+            (change_id, 1),
+        ).fetchone()
+        conn.close()
+        prefix = 0
+        while prefix + 1 in matched_positions:
+            prefix += 1
+        assert result['merged_patches'] == prefix
+        assert [patch['merged_commit'] for patch in patches] == [None] + [
+            f'upstream-{position}' if position <= prefix else None
+            for position in range(1, 4)
+        ]
+        assert rows[0] == 'new'
+
+    def test_update_marks_series_merged_when_all_patches_are_upstream(self) -> None:
+        identifier = 'all-merged-status-test'
+        change_id = 'all-merged-status'
+        msgs = _series_msgs(change_id, AUTHOR, 1, 2, cover=True)
+        lmbx = b4.LoreMailbox()
+        for msg in msgs:
+            lmbx.add_message(msg)
+        lser = lmbx.get_series(1)
+        assert lser is not None
+
+        upstream = {
+            patch.subject: [
+                _review.UpstreamCommit(
+                    f'upstream-{idx}',
+                    patch.fromname,
+                    patch.fromemail,
+                    int(patch.date.timestamp()) + 3600,
+                )
+            ]
+            for idx, patch in enumerate(lser.patches[1:], start=1)
+            if patch is not None
+        }
+        assert len(upstream) == 2
+        conn = review_tracking.init_db(identifier)
+        review_tracking.add_series_to_db(
+            conn,
+            change_id,
+            1,
+            'Merged status test',
+            'Author',
+            'author@example.com',
+            '2026-03-19T00:00:00+00:00',
+            'all-merged-status-p0@example.com',
+            2,
+        )
+        review_tracking.add_series_patches(conn, change_id, 1, lser)
+        conn.close()
+
+        series = {
+            'change_id': change_id,
+            'revision': 1,
+            'status': 'reviewing',
+            'message_id': 'all-merged-status-p0@example.com',
+        }
+        with (
+            mock.patch('b4.can_network', False),
+            mock.patch('b4.review._review.retrieve_series_messages', return_value=msgs),
+            mock.patch('b4.review._review.check_series_attestation', return_value=None),
+        ):
+            result = b4.review.update_series_tracking(
+                series,
+                identifier,
+                'https://example.com/%s',
+                upstream_commits=upstream,
+            )
+
+        conn = review_tracking.get_db(identifier)
+        row = conn.execute(
+            'SELECT status FROM series WHERE change_id = ? AND revision = ?',
+            (change_id, 1),
+        ).fetchone()
+        conn.close()
+        assert result['merged_patches'] == 2
+        assert row[0] == 'merged'
+
+    @pytest.mark.parametrize('cover', [False, True])
+    @pytest.mark.parametrize('checked_out', [False, True])
+    def test_update_marks_single_patch_merged_without_matching_diff(
+        self,
+        gitdir: str,
+        cover: bool,
+        checked_out: bool,
+    ) -> None:
+        identifier = 'single-merged-status-test'
+        change_id = 'single-merged-status'
+        msgs = _series_msgs(change_id, AUTHOR, 1, 1, cover=cover)
+        if not cover:
+            msgs[0].replace_header('Subject', f'[PATCH] {change_id}: part 1')
+        lmbx = b4.LoreMailbox()
+        for msg in msgs:
+            lmbx.add_message(msg)
+        lser = lmbx.get_series(1)
+        assert lser is not None and lser.complete and lser.expected == 1
+        patch = lser.patches[1]
+        assert patch is not None
+
+        conn = review_tracking.init_db(identifier)
+        review_tracking.add_series_to_db(
+            conn,
+            change_id,
+            1,
+            patch.subject,
+            patch.fromname,
+            patch.fromemail,
+            patch.date.isoformat(),
+            patch.msgid,
+            1,
+        )
+        review_tracking.update_series_status(conn, change_id, 'reviewing')
+        conn.close()
+        tracking = make_tracking_data(
+            change_id,
+            identifier=identifier,
+            subject=patch.subject,
+            patches=[
+                {
+                    'title': patch.subject,
+                    'header-info': {'msgid': patch.msgid},
+                }
+            ],
+        )
+        branch = create_review_branch(
+            gitdir,
+            change_id,
+            tracking_data=tracking,
+            checkout=checked_out,
+        )
+        before_sha = b4.git_revparse_obj(branch, gitdir)
+        upstream = {
+            patch.subject: [
+                _review.UpstreamCommit(
+                    'upstream-single',
+                    patch.fromname,
+                    patch.fromemail,
+                    int(patch.date.timestamp()) + 3600,
+                ),
+            ],
+        }
+        series = {
+            'change_id': change_id,
+            'revision': 1,
+            'status': 'reviewing',
+            'message_id': patch.msgid,
+        }
+        with (
+            mock.patch('b4.can_network', False),
+            mock.patch('b4.review._review.retrieve_series_messages', return_value=msgs),
+            mock.patch('b4.review._review.check_series_attestation', return_value=None),
+        ):
+            result = b4.review.update_series_tracking(
+                series,
+                identifier,
+                'https://example.com/%s',
+                topdir=gitdir,
+                upstream_commits=upstream,
+            )
+
+        conn = review_tracking.get_db(identifier)
+        conn.execute(
+            'UPDATE series SET branch_sha = NULL WHERE change_id = ?',
+            (change_id,),
+        )
+        conn.commit()
+        conn.close()
+        review_tracking.rescan_branches(identifier, gitdir, branch=branch)
+        conn = review_tracking.get_db(identifier)
+        row = conn.execute(
+            'SELECT status FROM series WHERE change_id = ?',
+            (change_id,),
+        ).fetchone()
+        patches = review_tracking.get_series_patches(conn, change_id, 1)
+        conn.close()
+        assert result['merged_patches'] == 1
+        assert result.get('error') is None
+        assert row['status'] == 'merged'
+        assert patches[0]['merged_commit'] == 'upstream-single'
+        if checked_out:
+            assert b4.git_revparse_obj(branch, gitdir) == before_sha
+        else:
+            _, saved = b4.review.load_tracking(gitdir, branch)
+            assert saved['series']['status'] == 'merged'
+            assert saved['series']['merged-commits'] == {'1': 'upstream-single'}
+
+    @pytest.mark.parametrize(
+        'body_author, commit_email, subject_suffix, offset, date, matches',
+        [
+            (None, 'submitter@example.com', '', 1, None, True),
+            (None, 'SUBMITTER@example.com', '', 1, None, True),
+            (None, 'other@example.com', '', 1, None, False),
+            (None, 'submitter@example.com', ' extra', 1, None, False),
+            (None, 'submitter@example.com', '', -1, None, False),
+            (None, 'submitter@example.com', '', 1, 'not a date', False),
+            (None, 'submitter@example.com', '', 1, '', False),
+            (
+                'Original <original@example.com>',
+                'original@example.com',
+                '',
+                1,
+                None,
+                True,
+            ),
+            (
+                'Original <original@example.com>',
+                'submitter@example.com',
+                '',
+                1,
+                None,
+                False,
+            ),
+        ],
+    )
+    def test_upstream_match_uses_subject_author_and_commit_date(
+        self,
+        body_author: Optional[str],
+        commit_email: str,
+        subject_suffix: str,
+        offset: int,
+        date: Optional[str],
+        matches: bool,
+    ) -> None:
+        from b4.review import _review
+
+        msg = _series_msgs('identity', 'Submitter <submitter@example.com>', 1, 1)[0]
+        if body_author:
+            msg.set_payload(f'From: {body_author}\n\nCommit message.\n\n{_pos_diff(1)}')
+        patch = b4.LoreMessage(msg)
+        committed_at = int(patch.date.timestamp()) + offset
+        if date is not None:
+            if date:
+                msg.replace_header('Date', date)
+            else:
+                del msg['Date']
+        upstream = {
+            patch.subject + subject_suffix: [
+                _review.UpstreamCommit(
+                    'upstream', 'Author', commit_email, committed_at
+                ),
+            ],
+        }
+        assert _review._match_upstream_commit(patch, upstream) == (
+            'upstream' if matches else None
+        )
 
 
 # ---------------------------------------------------------------------------

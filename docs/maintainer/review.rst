@@ -127,12 +127,13 @@ Status         Meaning
 ``partial``    Some patches applied; remainder still under review
 ``accepted``   All patches applied to the target branch
 ``thanked``    Thank-you note sent to the contributor
+``merged``     All patches found in the upstream branch
 ``archived``   Review completed and archived
 ``gone``       Review branch deleted or missing (e.g. after a sync)
 =============  =========================================================
 
 Series are grouped by lifecycle stage — Active (reviewing/replied/
-partial/accepted/thanked), New, Waiting, Snoozed, and Gone — and sorted
+partial/accepted/thanked/merged), New, Waiting, Snoozed, and Gone — and sorted
 within each group by the most recent activity, whether that is a new
 mailing list reply or a local status change. A ``waiting`` series is
 pulled up into the Active group the moment a newer revision is
@@ -153,7 +154,9 @@ Each row in the tracking list shows:
 * **Msgs** — total message count for the thread, with any unseen
   messages shown as ``+N`` in yellow (populated after pressing ``u``)
 * **S** — single-character status symbol, optionally followed by a
-  flag: ``*`` means the tracking data needs a refresh, ``↑`` means a
+  flag. A violet ``✔`` means the tracked revision is merged upstream;
+  the details panel lists matched patch positions. For other statuses,
+  ``*`` means the tracking data needs a refresh, ``↑`` means a
   newer revision is available (upgrade via the action menu). The two
   are mutually exclusive — ``↑`` can only appear once revision data
   has been fetched
@@ -162,19 +165,20 @@ Each row in the tracking list shows:
 
 **Status symbols**
 
-=======  =============
-Symbol   Status
-=======  =============
-``★``    new
-``✎``    reviewing
-``↩``    replied
-``↻``    waiting
-``⏸``    snoozed
-``◐``    partial
-``∈``    accepted
-``✓``    thanked
-``∅``    gone
-=======  =============
+========  ===============
+Symbol    Status
+========  ===============
+``★``     new
+``✎``     reviewing
+``↩``     replied
+``↻``     waiting
+``⏸``     snoozed
+``◐``     partial
+``∈``     accepted
+``✓``     thanked
+``✔``     merged (violet)
+``∅``     gone
+========  ===============
 
 **Keybindings**
 
@@ -874,14 +878,32 @@ Taking action
 
 Upgrading to a newer revision
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Press ``u`` to update the selected series (or ``U`` for all series) and
-discover new revisions. Updating only *records* what it finds — it
-never changes a series' status behind your back. When a newer revision
-is known, b4 lets you know in several ways: the row gets an ``↑``
-suffix flag in the tracking list, the Revisions line in the details
-panel shows *(vN available — upgrade with [a]ction)*, a ``waiting``
-series surfaces back into the Active group, and the ``up:`` limit
-token can filter the list down to just the upgradable series.
+Press ``u`` to update the selected series (or ``U`` for all series),
+discover new revisions, and check whether patches have landed upstream.
+Updating records new revisions without upgrading the tracked revision.
+It also marks the tracked revision ``merged`` when every patch is found
+upstream, including submissions containing a single patch.
+
+When a newer revision is known, b4 lets you know in several ways:
+the row gets an ``↑`` suffix flag in the tracking list, the Revisions
+line in the details panel shows *(vN available — upgrade with [a]ction)*,
+a ``waiting`` series surfaces back into the Active group, and the ``up:``
+limit token can filter the list down to just the upgradable series.
+
+During an update, b4 matches each mail's subject (without the ``[PATCH]``
+prefix) and author email against upstream commits made no earlier than
+the mail's date. An in-body ``From:`` overrides the mail sender. Diff
+contents are not compared, so maintainer edits do not prevent detection.
+Only a consecutive prefix starting at patch 1 counts as merged; the
+details panel lists its positions. A complete match changes the status
+to ``merged``, shown by a violet tick in the ``S`` column. Snoozed,
+archived, and gone entries retain their status.
+
+Set :term:`b4.upstream-repo` to choose the repository. If it is unset,
+b4 uses an ``upstream`` remote or discovers the parent of a GitHub
+``origin``. Set :term:`b4.upstream-branch` to select the branch,
+for example ``staging``. A failed upstream fetch leaves the previous
+indicators unchanged.
 
 Upgrading itself is always an explicit action: open the action menu
 (``a``) and select **Upgrade**. Availability depends only on a newer

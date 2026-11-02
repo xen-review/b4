@@ -256,6 +256,7 @@ REVIEW_SERIES_STATUSES: Tuple[str, ...] = (
     'queued',
     'snoozed',
     'thanked',
+    'merged',
     'gone',
     'archived',
 )
@@ -311,6 +312,8 @@ SCRATCH_GIT_OPTS: List[str] = [
 DEFAULT_CONFIG: ConfigDictT = {
     'midmask': LOREADDR + '/all/%s',
     'linkmask': LINKADDR + '/%s',
+    'upstream-repo': None,
+    'upstream-branch': None,
     # You can override the format for the Link: trailer, e.g.
     # if you would rather use the Message-Id trailer. It takes the
     # message-id as the expansion for %s
@@ -5005,6 +5008,7 @@ def _setup_main_config(
         '*template*',
         'trailer*',
         'pw-*',
+        'upstream-*',
     ]
     multivals = [
         'keyringsrc',

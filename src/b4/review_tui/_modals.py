@@ -3386,12 +3386,16 @@ class UpdateAllScreen(ModalScreen[Dict[str, Any]]):
         identifier: str,
         linkmask: str,
         topdir: Optional[str] = None,
+        upstream_repo: Optional[str] = None,
+        upstream_branch: Optional[str] = None,
     ) -> None:
         super().__init__()
         self._series_list = series_list
         self._identifier = identifier
         self._linkmask = linkmask
         self._topdir = topdir
+        self._upstream_repo = upstream_repo
+        self._upstream_branch = upstream_branch
         self._cancelled = False
         self._result: Dict[str, Any] = {
             'series_checked': 0,
@@ -3440,6 +3444,8 @@ class UpdateAllScreen(ModalScreen[Dict[str, Any]]):
                     series_list=self._series_list,
                     progress_cb=_on_progress,
                     cancel_cb=_should_cancel,
+                    upstream_repo=self._upstream_repo,
+                    upstream_branch=self._upstream_branch,
                 )
             except b4.LockHeldError:
                 self._result['busy'] = True
