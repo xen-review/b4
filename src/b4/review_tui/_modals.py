@@ -5,6 +5,7 @@
 #
 __author__ = 'Konstantin Ryabitsev <konstantin@linuxfoundation.org>'
 
+import datetime
 import email.message
 import email.utils
 import io
@@ -18,10 +19,11 @@ from rich.rule import Rule
 from rich.text import Text
 from textual.app import ComposeResult
 from textual.binding import Binding
-from textual.containers import Vertical
+from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
 from textual.suggester import SuggestFromList
 from textual.widgets import (
+    Button,
     Checkbox,
     Input,
     Label,
@@ -37,6 +39,7 @@ from textual.worker import Worker, WorkerState
 
 import b4
 import b4.review
+import b4.review.tracking
 import b4.tofu
 import b4.ty
 import liblore
@@ -227,6 +230,432 @@ class TrailerScreen(JKListNavMixin, ModalScreen[Optional[List[str]]]):
         self.dismiss(None)
 
 
+class AddSeriesItem(ListItem):
+    """One selectable patch-series candidate in the add-series popup."""
+
+    def __init__(self, candidate: Dict[str, Any], selected: bool = False) -> None:
+        super().__init__()
+        self.candidate = candidate
+        self.selected = selected
+
+    def compose(self) -> ComposeResult:
+        yield Static(self._label(), markup=False)
+
+    def _label(self) -> str:
+        mark = 'x' if self.selected else ' '
+        date = self.candidate.get('date')
+        date_text = date.strftime('%Y-%m-%d') if date else 'unknown date'
+        subject = self.candidate.get('subject') or '(no subject)'
+        sender = self.candidate.get('fromname') or self.candidate.get('fromemail')
+        email_addr = self.candidate.get('fromemail')
+        return (
+            f'[{mark}] v{self.candidate["revision"]} {date_text}  {subject}  '
+            f'— {sender} <{email_addr}>'
+        )
+
+    def toggle(self) -> None:
+        self.selected = not self.selected
+        self.query_one(Static).update(self._label())
+
+
+class AddSeriesScreen(ModalScreen[Optional[Dict[str, Any]]]):
+    """Browse recent Lore submissions and add selected series to tracking."""
+
+    BINDINGS = [
+        Binding('space', 'toggle_candidate', 'Select', show=False),
+        Binding('ctrl+y', 'track_selected', 'Track', show=False),
+        Binding('escape', 'cancel', 'Cancel'),
+        Binding('q', 'cancel', 'Cancel', show=False),
+    ]
+
+    DEFAULT_CSS = """
+    AddSeriesScreen {
+        align: center middle;
+    }
+    #add-series-dialog {
+        width: 90%;
+        height: 85%;
+        border: solid $accent;
+        background: $surface;
+        padding: 1 2;
+    }
+    #add-series-list {
+        height: 1fr;
+    }
+    #add-series-hint {
+        height: 1;
+        color: $text-muted;
+    }
+    #add-series-actions {
+        height: 3;
+        align-horizontal: right;
+    }
+    #add-series-status {
+        height: 1;
+        color: $text-muted;
+    }
+    """
+
+    _RECENT_DAYS = 7
+
+    def __init__(self, identifier: str, list_address: str) -> None:
+        super().__init__()
+        self._identifier = identifier
+        self._list_address = list_address
+        self._candidates: Dict[str, Dict[str, Any]] = {}
+        self._selected: Set[str] = set()
+        self._searched_filters: Set[str] = set()
+        self._filter_generation = 0
+        self._search_generation = 0
+        self._is_tracking = False
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id='add-series-dialog') as dialog:
+            dialog.border_title = 'Add Series'
+            yield Input(
+                placeholder='Filter by subject or submitter name or email',
+                id='add-series-filter',
+            )
+            yield Static(
+                f'Recent submissions to {self._list_address}', id='add-series-list-name'
+            )
+            yield Static('Loading recent submissions…', id='add-series-status')
+            yield ListView(id='add-series-list')
+            yield Static(
+                'Space select  |  Enter select  |  Ctrl-y track', id='add-series-hint'
+            )
+            with Horizontal(id='add-series-actions'):
+                yield Button(
+                    'Track selected (0)',
+                    id='add-series-track',
+                    variant='primary',
+                    disabled=True,
+                )
+                yield Button('Cancel', id='add-series-cancel')
+
+    def on_mount(self) -> None:
+        self.query_one('#add-series-filter', Input).focus()
+        start = datetime.datetime.now(
+            datetime.timezone.utc
+        ).date() - datetime.timedelta(days=self._RECENT_DAYS)
+        self._start_search(f'd:{start:%Y%m%d}..', filter_text='', recent=True)
+
+    def _visible_capacity(self) -> int:
+        height = self.query_one('#add-series-list', ListView).size.height
+        return max(8, height - 1)
+
+    @staticmethod
+    def _server_query(value: str) -> str:
+        escaped = value.replace('\\', '\\\\').replace('"', '\\"')
+        return f'(s:"{escaped}" OR f:"{escaped}")'
+
+    @staticmethod
+    def _group_key(msg: email.message.EmailMessage) -> Optional[Tuple[str, ...]]:
+        lsubject = b4.LoreSubject(str(msg.get('Subject', '')))
+        if lsubject.reply or not lsubject.patch or lsubject.counter not in (0, 1):
+            return None
+
+        from_data = email.utils.getaddresses([str(msg.get('From', ''))])
+        from_email = from_data[0][1].casefold() if from_data else ''
+        body, _charset = b4.LoreMessage.get_payload(msg)
+        match = re.search(r'^change-id:\s*(\S+)', body, flags=re.I | re.M)
+        if match:
+            return ('change-id', match.group(1).casefold())
+        return ('subject', from_email, lsubject.subject.casefold())
+
+    def _collect_candidates(
+        self, msgs: List[email.message.EmailMessage]
+    ) -> List[Dict[str, Any]]:
+        groups: Dict[Tuple[str, ...], List[email.message.EmailMessage]] = {}
+        cover_msgids = {
+            msgid
+            for msg in msgs
+            if b4.LoreSubject(str(msg.get('Subject', ''))).counter == 0
+            and (msgid := b4.LoreMessage.get_clean_msgid(msg))
+        }
+        for msg in msgs:
+            lsubject = b4.LoreSubject(str(msg.get('Subject', '')))
+            if lsubject.counter == 1:
+                parents = [
+                    b4.LoreMessage.get_clean_msgid(msg, header='In-Reply-To') or ''
+                ]
+                references = b4.LoreMessage.clean_header(str(msg.get('References', '')))
+                parents.extend(ref.strip('<>') for ref in references.split())
+                if cover_msgids.intersection(parents):
+                    continue
+            key = self._group_key(msg)
+            if key is not None:
+                groups.setdefault(key, []).append(msg)
+
+        candidates: Dict[str, Dict[str, Any]] = {}
+        conn = b4.review.tracking.get_db(self._identifier)
+        try:
+            for group_msgs in groups.values():
+                mailbox = b4.LoreMailbox()
+                for msg in group_msgs:
+                    mailbox.add_message(msg)
+                if mailbox.series:
+                    revision = max(mailbox.series)
+                    lser = mailbox.get_series(
+                        revision, sloppytrailers=False, codereview_trailers=False
+                    )
+                    if not lser:
+                        continue
+                    message_id, _subject, _from_cover = (
+                        b4.review.tracking._raw_revision_ref(mailbox, revision)
+                    )
+                    subject = lser.subject
+                    fromname = lser.fromname
+                    fromemail = lser.fromemail
+                    num_patches = lser.expected
+                    change_id = lser.change_id
+                    ref_msg = mailbox.msgid_map.get(message_id)
+                elif mailbox.covers:
+                    revision = max(mailbox.covers)
+                    cover = mailbox.covers[revision]
+                    message_id = cover.msgid
+                    subject = cover.subject
+                    fromname = cover.fromname
+                    fromemail = cover.fromemail
+                    num_patches = cover.expected
+                    change_id = ''
+                    ref_msg = cover
+                else:
+                    continue
+                if not message_id or b4.review.tracking.find_tracked_change_id(
+                    conn, message_id
+                ):
+                    continue
+                candidates[message_id] = {
+                    'message_id': message_id,
+                    'revision': revision,
+                    'subject': subject,
+                    'fromname': fromname,
+                    'fromemail': fromemail,
+                    'num_patches': num_patches,
+                    'change_id': change_id,
+                    'date': ref_msg.date if ref_msg else None,
+                }
+        finally:
+            conn.close()
+
+        return sorted(
+            candidates.values(),
+            key=lambda item: (
+                item['date']
+                or datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)
+            ),
+            reverse=True,
+        )
+
+    def _start_search(self, query: str, filter_text: str, recent: bool = False) -> None:
+        self._search_generation += 1
+        generation = self._search_generation
+        self.query_one('#add-series-status', Static).update(
+            'Loading recent submissions…'
+            if recent
+            else f'Searching Lore for {filter_text!r}…'
+        )
+
+        def _fetch() -> None:
+            try:
+                with _quiet_worker():
+                    msgs = (
+                        b4.get_pi_search_results(
+                            query, nocache=True, full_threads=not recent
+                        )
+                        or []
+                    )
+                    candidates = self._collect_candidates(msgs)
+            except liblore.OperationCancelledError:
+                return
+            except Exception as ex:
+                self.app.call_from_thread(
+                    self._finish_search, generation, filter_text, [], str(ex)
+                )
+                return
+            if worker_cancelled():
+                return
+            self.app.call_from_thread(
+                self._finish_search, generation, filter_text, candidates, ''
+            )
+
+        run_lore_worker(
+            self,
+            _fetch,
+            name=f'add-series-search-{generation}',
+            group='add-series-search',
+            exclusive=True,
+        )
+
+    def _finish_search(
+        self,
+        generation: int,
+        filter_text: str,
+        candidates: List[Dict[str, Any]],
+        error: str,
+    ) -> None:
+        if generation != self._search_generation:
+            return
+        if error:
+            self.query_one('#add-series-status', Static).update(
+                f'Lore search failed: {error}'
+            )
+            return
+        self._candidates.update(
+            {candidate['message_id']: candidate for candidate in candidates}
+        )
+        current_filter = self.query_one('#add-series-filter', Input).value.strip()
+        self._render_candidates(current_filter)
+
+    def _filtered_candidates(self, value: str) -> List[Dict[str, Any]]:
+        needle = value.casefold().strip()
+        candidates = list(self._candidates.values())
+        if needle:
+            candidates = [
+                candidate
+                for candidate in candidates
+                if needle
+                in ' '.join(
+                    str(candidate.get(field, ''))
+                    for field in ('subject', 'fromname', 'fromemail')
+                ).casefold()
+            ]
+        return candidates
+
+    def _render_candidates(self, value: str) -> None:
+        lv = self.query_one('#add-series-list', ListView)
+        candidates = self._filtered_candidates(value)
+        lv.clear()
+        for candidate in candidates:
+            lv.append(
+                AddSeriesItem(
+                    candidate, selected=candidate['message_id'] in self._selected
+                )
+            )
+        self.query_one('#add-series-status', Static).update(
+            f'{len(candidates)} matching series'
+        )
+        self._update_track_button()
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id != 'add-series-filter':
+            return
+        value = event.value.strip()
+        self._filter_generation += 1
+        generation = self._filter_generation
+        self._render_candidates(value)
+        if (
+            value
+            and len(self._filtered_candidates(value)) < self._visible_capacity()
+            and value.casefold() not in self._searched_filters
+        ):
+            self.set_timer(0.35, lambda: self._search_filter(value, generation))
+
+    def _search_filter(self, value: str, generation: int) -> None:
+        if generation != self._filter_generation:
+            return
+        key = value.casefold()
+        if key in self._searched_filters:
+            return
+        self._searched_filters.add(key)
+        self._start_search(self._server_query(value), value)
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        if event.input.id == 'add-series-filter':
+            self.query_one('#add-series-list', ListView).focus()
+
+    def on_list_view_selected(self, event: ListView.Selected) -> None:
+        if event.list_view.id != 'add-series-list':
+            return
+        event.stop()
+        self._toggle_candidate(event.item)
+
+    def action_toggle_candidate(self) -> None:
+        item = self.query_one('#add-series-list', ListView).highlighted_child
+        self._toggle_candidate(item)
+
+    def _toggle_candidate(self, item: Any) -> None:
+        if not isinstance(item, AddSeriesItem):
+            return
+        message_id = item.candidate['message_id']
+        if message_id in self._selected:
+            self._selected.remove(message_id)
+        else:
+            self._selected.add(message_id)
+        item.toggle()
+        self._update_track_button()
+
+    def _update_track_button(self) -> None:
+        button = self.query_one('#add-series-track', Button)
+        count = len(self._selected)
+        button.label = f'Track selected ({count})'
+        button.disabled = count == 0 or self._is_tracking
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == 'add-series-cancel':
+            self.action_cancel()
+        elif event.button.id == 'add-series-track':
+            self.action_track_selected()
+
+    def action_track_selected(self) -> None:
+        if self._is_tracking or not self._selected:
+            return
+        selected = [self._candidates[mid] for mid in self._selected]
+        self._is_tracking = True
+        self._update_track_button()
+        self.query_one('#add-series-status', Static).update(
+            f'Tracking {len(selected)} selected series…'
+        )
+
+        def _track() -> None:
+            result: Dict[str, Any] = {
+                'tracked': 0,
+                'updated': 0,
+                'already_tracked': 0,
+                'errors': [],
+            }
+            for candidate in selected:
+                if worker_cancelled():
+                    break
+                try:
+                    with _quiet_worker():
+                        outcome = b4.review.tracking.track_series_from_msgid(
+                            self._identifier,
+                            candidate['message_id'],
+                            b4.git_get_toplevel(),
+                        )
+                    if outcome['status'] == 'already-tracked':
+                        result['already_tracked'] += 1
+                    else:
+                        result[outcome['status']] += 1
+                except Exception as ex:
+                    result['errors'].append(f'{candidate["subject"]}: {ex}')
+            if worker_cancelled():
+                return
+            self.app.call_from_thread(self._finish_tracking, result)
+
+        run_lore_worker(self, _track, name='add-series-track', exclusive=True)
+
+    def _finish_tracking(self, result: Dict[str, Any]) -> None:
+        self._is_tracking = False
+        if result['tracked'] or result['updated']:
+            self.dismiss(result)
+            return
+        errors = result['errors']
+        if errors:
+            detail = errors[0]
+        elif result['already_tracked']:
+            detail = f'{result["already_tracked"]} selected series already tracked'
+        else:
+            detail = 'No new series were tracked'
+        self.query_one('#add-series-status', Static).update(detail)
+        self._update_track_button()
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 class HelpScreen(ModalScreen[None]):
     """Parametric modal showing keybinding help.
 
@@ -380,6 +809,7 @@ TRACKING_HELP_LINES = [
     '  [bold]e[/bold]         View email thread\n',
     '  [bold]d[/bold]         Range-diff between revisions\n',
     '  [bold]a[/bold]         Open action menu (take, rebase, etc.)\n',
+    '  [bold]A[/bold]         Add series from recent Lore submissions\n',
     '  [bold]u[/bold]         Update selected series\n',
     '\n',
     '[bold]App[/bold]\n',

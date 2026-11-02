@@ -582,6 +582,179 @@ def add_series_to_db(
     return int(track_id)
 
 
+def track_series_from_mailbox(
+    identifier: str,
+    lmbx: 'b4.LoreMailbox',
+    revision: int,
+    topdir: Optional[str] = None,
+    rethreaded: bool = False,
+) -> Dict[str, Any]:
+    """Record one mailbox series, folding newly discovered versions into an
+    existing tracked series when possible.
+
+    Returns the tracking status and series metadata for CLI and TUI callers.
+    """
+    lser = lmbx.get_series(revision, sloppytrailers=False, codereview_trailers=False)
+    if not lser:
+        raise LookupError(f'Could not find series version {revision}')
+
+    ref_msg: Optional[b4.LoreMessage] = None
+    if rethreaded:
+        for patch in lser.patches[1:]:
+            if patch is not None:
+                ref_msg = patch
+                break
+    elif lser.has_cover and lser.patches[0] is not None:
+        ref_msg = lser.patches[0]
+    elif len(lser.patches) > 1 and lser.patches[1] is not None:
+        ref_msg = lser.patches[1]
+
+    if ref_msg is None:
+        raise LookupError('Could not find cover letter or first patch')
+
+    message_id = ref_msg.msgid
+    fingerprint = lser.fingerprint
+    change_id = lser.change_id
+    generated_change_id = not bool(change_id)
+    if generated_change_id:
+        date_prefix = ref_msg.date.strftime('%Y%m%d')
+        slug = ref_msg.lsubject.get_slug(sep='-', with_counter=False)[:60]
+        change_id = f'{date_prefix}-{slug}-{fingerprint[:12]}'
+
+    config = b4.get_main_config()
+    linkmask = str(config.get('linkmask', ''))
+    conn = get_db(identifier)
+    try:
+        existing = conn.execute(
+            'SELECT change_id FROM series WHERE change_id = ? OR fingerprint = ?',
+            (change_id, fingerprint),
+        ).fetchone()
+        existing_change_id: Optional[str] = str(existing[0]) if existing else None
+        if existing_change_id is None:
+            discovered: List[Tuple[Optional[str], Optional[str]]] = []
+            for version in sorted(lmbx.series.keys()):
+                version_msgid, _subject, _from_cover = _raw_revision_ref(
+                    lmbx, version, rethreaded=(rethreaded and version == revision)
+                )
+                discovered.append(
+                    (
+                        getattr(lmbx.series[version], 'fingerprint', None),
+                        version_msgid or None,
+                    )
+                )
+            existing_change_id = find_existing_change_id(conn, discovered)
+
+        rethreaded_revs: Optional[Set[int]] = {revision} if rethreaded else None
+        if existing_change_id is not None:
+            new_revs = _record_discovered_revisions(
+                conn,
+                existing_change_id,
+                lmbx,
+                linkmask,
+                rethreaded_revs=rethreaded_revs,
+            )
+            row = conn.execute(
+                'SELECT status, revision FROM series WHERE change_id = ?',
+                (existing_change_id,),
+            ).fetchone()
+            status = str(row[0]) if row else 'unknown'
+            current_revision = int(row[1]) if row else 0
+            conn.commit()
+            result = {
+                'status': 'updated' if new_revs else 'already-tracked',
+                'change_id': existing_change_id,
+                'revision': current_revision,
+                'series_status': status,
+                'new_revisions': new_revs,
+                'subject': lser.subject,
+                'generated_change_id': generated_change_id,
+                'lore_series': lser,
+            }
+        else:
+            sent_at = ref_msg.date.isoformat() if ref_msg.date else None
+            add_series_to_db(
+                conn,
+                change_id,
+                lser.revision,
+                lser.subject,
+                lser.fromname,
+                lser.fromemail,
+                sent_at,
+                message_id,
+                lser.expected,
+                fingerprint=fingerprint,
+                is_rethreaded=rethreaded,
+            )
+            add_series_patches(conn, change_id, revision, lser)
+            _record_discovered_revisions(
+                conn,
+                change_id,
+                lmbx,
+                linkmask,
+                rethreaded_revs=rethreaded_revs,
+            )
+            conn.commit()
+            result = {
+                'status': 'tracked',
+                'change_id': change_id,
+                'revision': lser.revision,
+                'subject': lser.subject,
+                'sender_name': lser.fromname,
+                'sender_email': lser.fromemail,
+                'num_patches': lser.expected,
+                'complete': lser.complete,
+                'message_id': message_id,
+                'new_revisions': [],
+                'generated_change_id': generated_change_id,
+                'lore_series': lser,
+            }
+    finally:
+        conn.close()
+
+    if result['status'] in ('tracked', 'updated'):
+        sync_revisions_catalog_to_branch(topdir, identifier, str(result['change_id']))
+    return result
+
+
+def track_series_from_msgid(
+    identifier: str, message_id: str, topdir: Optional[str] = None
+) -> Dict[str, Any]:
+    """Fetch and track the latest series revision identified by *message_id*."""
+    cmdargs = argparse.Namespace(
+        msgid=message_id,
+        localmbox=None,
+        nocache=True,
+        noparent=False,
+        wantname=None,
+        wantver=None,
+    )
+    _root_msgid, msgs = b4.retrieve_messages(cmdargs)
+    if not msgs:
+        raise LookupError(f'Could not retrieve series: {message_id}')
+
+    lmbx = b4.LoreMailbox()
+    for msg in msgs:
+        lmbx.add_message(msg)
+    if not lmbx.series:
+        raise LookupError('No series found in retrieved messages')
+
+    wanted_ver = max(lmbx.series.keys())
+    if b4.can_network:
+        msgs = b4.mbox.get_extra_series(msgs, direction=1, nocache=True)
+        if wanted_ver > 1:
+            msgs = b4.mbox.get_extra_series(
+                msgs,
+                direction=-1,
+                wantvers=list(range(1, wanted_ver)),
+                nocache=True,
+            )
+        lmbx = b4.LoreMailbox()
+        for msg in msgs:
+            lmbx.add_message(msg)
+
+    return track_series_from_mailbox(identifier, lmbx, wanted_ver, topdir)
+
+
 def cmd_track(cmdargs: argparse.Namespace) -> None:
     """Track a series in the review database."""
     topdir = b4.git_get_toplevel()
@@ -688,167 +861,65 @@ def cmd_track(cmdargs: argparse.Namespace) -> None:
     finally:
         signal.signal(signal.SIGINT, _old_sigint)
 
-    lser = lmbx.get_series(wanted_ver, sloppytrailers=False, codereview_trailers=False)
-    if not lser:
-        logger.critical('Could not find series version %d', wanted_ver)
+    try:
+        result = track_series_from_mailbox(
+            identifier, lmbx, wanted_ver, topdir, rethreaded=was_rethreaded
+        )
+    except LookupError as ex:
+        logger.critical('%s', ex)
         sys.exit(1)
 
-    # Extract series metadata
-    revision = lser.revision
-    sender_name = lser.fromname
-    sender_email = lser.fromemail
-    num_patches = lser.expected
-
-    fingerprint = lser.fingerprint
-
-    # Get message-id from cover letter or first patch.
-    # For rethreaded series, skip the synthetic cover and use the first
-    # real patch so the stored msgid is fetchable from lore.
-    ref_msg: Optional[b4.LoreMessage] = None
-    if was_rethreaded:
-        for p in lser.patches[1:]:
-            if p is not None:
-                ref_msg = p
-                break
-    else:
-        if lser.has_cover and lser.patches[0] is not None:
-            ref_msg = lser.patches[0]
-        elif len(lser.patches) > 1 and lser.patches[1] is not None:
-            ref_msg = lser.patches[1]
-
-    if ref_msg is None:
-        logger.critical('Could not find cover letter or first patch')
-        sys.exit(1)
-
-    message_id = ref_msg.msgid
-
-    if lser.change_id:
-        change_id = lser.change_id
-        logger.debug('Using series change-id: %s', change_id)
-    else:
-        date_prefix = ref_msg.date.strftime('%Y%m%d')
-        slug = ref_msg.lsubject.get_slug(sep='-', with_counter=False)[:60]
-        change_id = f'{date_prefix}-{slug}-{fingerprint[:12]}'
+    lser = result['lore_series']
+    change_id = str(result['change_id'])
+    revision = int(result['revision'])
+    if result['generated_change_id']:
         logger.info('No change-id found, generated: %s', change_id)
 
-    # Determine whether this thread already belongs to a tracked series.
-    # An exact change-id/fingerprint match on the requested version catches
-    # re-tracking the same series (or a newer version of a series that carries
-    # an embedded change-id).  Failing that, the sibling revisions discovered
-    # alongside it reveal a new version of an already-tracked series whose
-    # synthesized change-id and per-revision fingerprint both differ from the
-    # tracked version (bug 70fe607).
-    config = b4.get_main_config()
-    linkmask = str(config.get('linkmask', ''))
-    conn = get_db(identifier)
-    existing = conn.execute(
-        'SELECT change_id FROM series WHERE change_id = ? OR fingerprint = ?',
-        (change_id, fingerprint),
-    ).fetchone()
-    existing_change_id: Optional[str] = str(existing[0]) if existing else None
-    if existing_change_id is None:
-        discovered: List[Tuple[Optional[str], Optional[str]]] = []
-        for v in sorted(lmbx.series.keys()):
-            v_msgid, _, _ = _raw_revision_ref(
-                lmbx, v, rethreaded=(was_rethreaded and v == revision)
-            )
-            discovered.append((getattr(lmbx.series[v], 'fingerprint', None), v_msgid))
-        existing_change_id = find_existing_change_id(conn, discovered)
-
-    # The rethreaded revision can't be re-fetched from a single message-id, so
-    # its member patches must be recorded under whichever change-id wins.
-    rethreaded_revs: Optional[Set[int]] = {revision} if was_rethreaded else None
-
-    if existing_change_id is not None:
-        # Already tracked: fold any newly discovered revisions into the
-        # existing series instead of creating a duplicate (bug 70fe607).
-        new_revs = _record_discovered_revisions(
-            conn, existing_change_id, lmbx, linkmask, rethreaded_revs=rethreaded_revs
-        )
-        srow = conn.execute(
-            'SELECT status, revision FROM series WHERE change_id = ?',
-            (existing_change_id,),
-        ).fetchone()
-        conn.close()
-        status_str = str(srow[0]) if srow else 'unknown'
-        cur_rev = int(srow[1]) if srow else 0
-        if new_revs:
-            # Mirror the freshly-recorded catalog onto the existing review
-            # branch so the pending upgrade travels on push (it can't be
-            # re-derived from lore when rethreaded).
-            sync_revisions_catalog_to_branch(topdir, identifier, existing_change_id)
-            logger.info(
-                'Series already tracked as %s (status: %s, v%d)',
-                existing_change_id,
-                status_str,
-                cur_rev,
-            )
-            logger.info(
-                '  Recorded new revision(s): %s',
-                ', '.join(f'v{v}' for v in new_revs),
-            )
-            if status_str == 'archived':
-                # Archived series are not shown in the review TUI, so the
-                # usual upgrade advice would point at nothing actionable.
-                logger.info('  This series is archived and not shown in the TUI.')
-                logger.info(
-                    '  Use "b4 review forget %s" to erase it and track afresh.',
-                    existing_change_id,
-                )
-            else:
-                logger.info(
-                    '  Upgrade the series in the review TUI to the new version.'
-                )
-            return
+    if result['status'] == 'already-tracked':
         logger.critical(
-            'This series is already tracked (status: %s, v%d)', status_str, cur_rev
+            'This series is already tracked (status: %s, v%d)',
+            result['series_status'],
+            revision,
         )
-        logger.critical('Change-ID: %s', existing_change_id)
+        logger.critical('Change-ID: %s', change_id)
         logger.critical(
-            'Use "b4 review forget %s" to erase it and track afresh.',
-            existing_change_id,
+            'Use "b4 review forget %s" to erase it and track afresh.', change_id
         )
         sys.exit(1)
 
-    # Not tracked yet — create a new series and record its revisions.
-    sent_at: Optional[str] = None
-    if ref_msg.date:
-        sent_at = ref_msg.date.isoformat()
+    if result['status'] == 'updated':
+        new_revs = result['new_revisions']
+        logger.info(
+            'Series already tracked as %s (status: %s, v%d)',
+            change_id,
+            result['series_status'],
+            revision,
+        )
+        logger.info(
+            '  Recorded new revision(s): %s', ', '.join(f'v{v}' for v in new_revs)
+        )
+        if result['series_status'] == 'archived':
+            logger.info('  This series is archived and not shown in the TUI.')
+            logger.info(
+                '  Use "b4 review forget %s" to erase it and track afresh.', change_id
+            )
+        else:
+            logger.info('  Upgrade the series in the review TUI to the new version.')
+        return
 
-    subject = lser.subject
-    add_series_to_db(
-        conn,
-        change_id,
+    logger.info(
+        'Tracked series: %s v%d (%d patches)',
+        result['subject'],
         revision,
-        subject,
-        sender_name,
-        sender_email,
-        sent_at,
-        message_id,
-        num_patches,
-        fingerprint=fingerprint,
-        is_rethreaded=was_rethreaded,
+        result['num_patches'],
     )
-    add_series_patches(conn, change_id, revision, lser)
-    _record_discovered_revisions(
-        conn, change_id, lmbx, linkmask, rethreaded_revs=rethreaded_revs
-    )
-    conn.close()
-    # Mirror the catalog onto the review branch when one already exists (a
-    # fresh track usually has none yet — this is then a harmless no-op).
-    sync_revisions_catalog_to_branch(topdir, identifier, change_id)
-
-    logger.info('Tracked series: %s v%d (%d patches)', subject, revision, num_patches)
-    logger.info('  From: %s <%s>', sender_name, sender_email)
+    logger.info('  From: %s <%s>', result['sender_name'], result['sender_email'])
     logger.info('  Change-ID: %s', change_id)
-    logger.info('  Message-ID: %s', message_id)
+    logger.info('  Message-ID: %s', result['message_id'])
     if len(lmbx.series) > 1:
         versions = ', '.join(f'v{v}' for v in sorted(lmbx.series.keys()))
         logger.info('  Known revisions: %s', versions)
-    # The count above is what the series says it should contain, so say so
-    # loudly when we actually got less than that -- a silent partial import
-    # looks identical to a successful one.
-    if not lser.complete:
+    if not result['complete']:
         missing = [
             str(at) for at, patch in enumerate(lser.patches) if at > 0 and patch is None
         ]
@@ -856,7 +927,7 @@ def cmd_track(cmdargs: argparse.Namespace) -> None:
         logger.critical(
             'WARNING: Thread incomplete, missing %d of %d patches: %s',
             len(missing),
-            num_patches,
+            result['num_patches'],
             ', '.join(missing),
         )
 

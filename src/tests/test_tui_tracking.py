@@ -26,7 +26,7 @@ pytest.importorskip('textual')
 
 from textual.app import App
 from textual.containers import Vertical
-from textual.widgets import Footer, Input, ListView, Static
+from textual.widgets import Button, Footer, Input, ListView, Static
 
 import b4
 import b4.review
@@ -42,6 +42,8 @@ from b4 import (
 from b4.review_tui._modals import (
     ActionItem,
     ActionScreen,
+    AddSeriesItem,
+    AddSeriesScreen,
     BadCharsScreen,
     BaseSelectionScreen,
     CherryPickScreen,
@@ -67,6 +69,7 @@ from b4.review_tui._tracking_app import (
     _worktree_for_branch,
 )
 
+from .helpers.mail import MINIMAL_DIFF, make_msg
 from .helpers.tracking import create_review_branch, seed_db, tag
 from .helpers.tui import static_text
 
@@ -133,6 +136,146 @@ def _get_action_keys(app: TrackingApp) -> List[str]:
 
 class TestTrackingAppStartup:
     """Tests for the TrackingApp startup and series listing."""
+
+    @pytest.mark.asyncio
+    async def test_capital_a_opens_add_series_popup(
+        self, tmp_path: pathlib.Path
+    ) -> None:
+        seed_db('test-add-series', [])
+        app = TrackingApp('test-add-series')
+
+        with patch('b4.get_pi_search_results', return_value=[]):
+            async with app.run_test(size=(120, 30)) as pilot:
+                await pilot.pause()
+                original_screen = app.screen
+                await pilot.press('A')
+                await pilot.pause()
+                await app.workers.wait_for_complete()
+
+                assert app.screen is not original_screen
+                assert app.screen.query_one('#add-series-filter', Input)
+
+    def test_candidate_search_groups_series_at_the_cover_or_first_patch(
+        self, tmp_path: pathlib.Path
+    ) -> None:
+        identifier = 'test-add-grouping'
+        seed_db(identifier, [])
+        screen = AddSeriesScreen(identifier, 'xen-devel@lists.xenproject.org')
+        messages = [
+            make_msg(
+                'cover@example.com',
+                '[PATCH 0/2] Covered series',
+                body='Series cover.\n',
+            ),
+            make_msg(
+                'covered-patch1@example.com',
+                '[PATCH 1/2] Covered series: first patch',
+                body=MINIMAL_DIFF,
+                in_reply_to='cover@example.com',
+            ),
+            make_msg(
+                'covered-patch2@example.com',
+                '[PATCH 2/2] Covered series: second patch',
+                body=MINIMAL_DIFF,
+                in_reply_to='cover@example.com',
+            ),
+            make_msg(
+                'uncovered-patch1@example.com',
+                '[PATCH 1/2] Uncovered series: first patch',
+                body=MINIMAL_DIFF,
+            ),
+            make_msg(
+                'uncovered-patch2@example.com',
+                '[PATCH 2/2] Uncovered series: second patch',
+                body=MINIMAL_DIFF,
+            ),
+        ]
+
+        candidates = screen._collect_candidates(messages)
+
+        assert {candidate['message_id'] for candidate in candidates} == {
+            'cover@example.com',
+            'uncovered-patch1@example.com',
+        }
+
+    @pytest.mark.asyncio
+    async def test_filter_searches_lore_and_tracks_selected_series(
+        self, tmp_path: pathlib.Path
+    ) -> None:
+        seed_db('test-add-search', [])
+        candidate = {
+            'message_id': 'cover@example.com',
+            'revision': 2,
+            'subject': '[PATCH v2] unique search subject',
+            'fromname': 'Unique Author',
+            'fromemail': 'unique@example.com',
+            'num_patches': 3,
+            'change_id': 'unique-change-id',
+            'date': None,
+        }
+        app = TrackingApp('test-add-search')
+
+        with (
+            patch('b4.get_pi_search_results', side_effect=[[], [object()]]) as search,
+            patch.object(
+                AddSeriesScreen,
+                '_collect_candidates',
+                side_effect=[[], [candidate]],
+            ),
+            patch(
+                'b4.review.tracking.track_series_from_msgid',
+                return_value={'status': 'tracked'},
+            ) as track,
+        ):
+            async with app.run_test(size=(120, 30)) as pilot:
+                await pilot.pause()
+                original_screen = app.screen
+                await pilot.press('A')
+                await pilot.pause()
+                await app.workers.wait_for_complete()
+                screen = app.screen
+                assert isinstance(screen, AddSeriesScreen)
+
+                filter_input = screen.query_one('#add-series-filter', Input)
+                filter_input.value = 'unique'
+                await pilot.pause(0.45)
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+
+                assert search.call_args_list[1].args[0] == (
+                    '(s:"unique" OR f:"unique")'
+                )
+                assert search.call_args_list[1].kwargs == {
+                    'nocache': True,
+                    'full_threads': True,
+                }
+                lv = screen.query_one('#add-series-list', ListView)
+                items = [
+                    item for item in lv.children if isinstance(item, AddSeriesItem)
+                ]
+                assert [item.candidate['message_id'] for item in items] == [
+                    'cover@example.com'
+                ]
+                assert [
+                    item['message_id']
+                    for item in screen._filtered_candidates('unique@example.com')
+                ] == ['cover@example.com']
+                assert not screen._filtered_candidates('not-a-match')
+                lv.focus()
+                lv.index = 0
+                await pilot.press('space')
+                await pilot.pause()
+                button = screen.query_one('#add-series-track', Button)
+                assert button.disabled is False
+                assert button.label == 'Track selected (1)'
+                await pilot.click('#add-series-track')
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+
+                track.assert_called_once_with(
+                    'test-add-search', 'cover@example.com', b4.git_get_toplevel()
+                )
+                assert app.screen is original_screen
 
     @pytest.mark.asyncio
     async def test_empty_database(self, tmp_path: pathlib.Path) -> None:

@@ -78,6 +78,7 @@ from b4.review_tui._modals import (
     TRACKING_HELP_LINES,
     AbandonConfirmScreen,
     ActionScreen,
+    AddSeriesScreen,
     ArchiveConfirmScreen,
     BadCharsScreen,
     BaseSelectionScreen,
@@ -1114,6 +1115,7 @@ class TrackingApp(LoreNodeShutdownMixin, CheckRunnerMixin, App[Optional[str]]):
         'range_diff': 'Series',
         'action': 'Series',
         'delete_series': 'Series',
+        'add_series': 'App',
         'update_one': 'Series',
         'target_branch': 'Series',
         'update_all': 'App',
@@ -1137,6 +1139,7 @@ class TrackingApp(LoreNodeShutdownMixin, CheckRunnerMixin, App[Optional[str]]):
         Binding('e', 'thread', 'thread'),
         Binding('a', 'action', 'action'),
         Binding('delete', 'delete_series', 'delete'),
+        Binding('A', 'add_series', 'add', key_display='A'),
         Binding('u', 'update_one', 'update'),
         Binding('d', 'range_diff', 'range-diff'),
         # App-global actions
@@ -1525,7 +1528,7 @@ class TrackingApp(LoreNodeShutdownMixin, CheckRunnerMixin, App[Optional[str]]):
 
             if not display_series:
                 empty = Static(
-                    'No tracked series. Use "b4 review track" to add series.',
+                    'No tracked series. Press A to browse recent submissions.',
                     id='tracking-empty',
                 )
                 await self.mount(empty, before=footer)
@@ -1581,6 +1584,32 @@ class TrackingApp(LoreNodeShutdownMixin, CheckRunnerMixin, App[Optional[str]]):
             ),
             callback=self._on_limit,
         )
+
+    def action_add_series(self) -> None:
+        list_address = str(b4.get_main_config().get('send-series-to', 'Lore archive'))
+        self.push_screen(
+            AddSeriesScreen(self._identifier, list_address),
+            callback=self._on_add_series,
+        )
+
+    def _on_add_series(self, result: Optional[Dict[str, Any]]) -> None:
+        if not result:
+            return
+        if result.get('tracked') or result.get('updated'):
+            self._invalidate_caches()
+            self._load_series()
+        parts = []
+        if result.get('tracked'):
+            parts.append(f'{result["tracked"]} tracked')
+        if result.get('updated'):
+            parts.append(f'{result["updated"]} updated')
+        if result.get('already_tracked'):
+            parts.append(f'{result["already_tracked"]} already tracked')
+        if result.get('errors'):
+            parts.append(f'{len(result["errors"])} failed')
+        if parts:
+            severity = 'warning' if result.get('errors') else 'information'
+            self.notify('; '.join(parts), severity=severity)
 
     def _on_limit(self, result: Optional[str]) -> None:
         if result is None:

@@ -186,6 +186,7 @@ Symbol    Status
 Key           Action
 ============  ===========================================================
 ``Enter``     Visit an existing review, or open the action menu if none exists
+``A``         Browse recent Lore submissions and track selected series
 ``r``         Review — create or re-enter the review branch
 ``t``         Target branch — set or clear the per-series target branch
 ``c``         CI checks — run configured check commands and show results
@@ -218,6 +219,14 @@ Key           Action
 Deleting a series removes its tracking records and local review branch.
 If the branch contains an edited, unsent reply for the cover letter or
 one of its patches, b4 asks for confirmation before deleting those drafts.
+
+Press ``A`` to browse submissions from the Lore archive configured by
+:term:`b4.midmask`. The popup initially lists the last seven days. Filter
+by subject, submitter name, or email; when fewer than a screen of local
+matches remain, b4 searches Lore for more matches. Use ``Space`` or
+``Enter`` to select multiple series, then press **Track selected**.
+Tracked series and newly discovered revisions follow the same tracking
+and deduplication rules as ``b4 review track``.
 
 Quitting takes a capital ``Q`` in all b4 TUI apps (tracking list,
 review interface, Patchwork browser, and ``b4 bugs``). Bare ``q``

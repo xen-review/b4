@@ -760,6 +760,47 @@ class TestCmdTrack:
         assert row[column] == expected
         assert row['revision'] == 1
 
+    @mock.patch('b4.retrieve_messages')
+    @mock.patch('b4.LoreMailbox')
+    def test_track_series_from_msgid_uses_shared_tracking_logic(
+        self,
+        mock_mailbox_class: mock.Mock,
+        mock_retrieve: mock.Mock,
+        gitdir: str,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        cmdargs_enroll = argparse.Namespace(
+            repo_path=gitdir, identifier='track-msgid-test'
+        )
+        review_tracking.cmd_enroll(cmdargs_enroll)
+        monkeypatch.setattr(b4, 'can_network', False)
+        mock_retrieve.return_value = ('cover@example.com', [mock.Mock()])
+
+        lser = self._make_mock_lore_series(
+            expected=1,
+            all_patches_present=True,
+            cover_msgid='cover@example.com',
+            first_patch_msgid='patch@example.com',
+        )
+        mailbox = mock.Mock()
+        mailbox.series = {1: lser}
+        mailbox.get_series.return_value = lser
+        mock_mailbox_class.return_value = mailbox
+
+        result = review_tracking.track_series_from_msgid(
+            'track-msgid-test', 'cover@example.com', gitdir
+        )
+
+        assert result['status'] == 'tracked'
+        assert result['change_id'] == 'test-change-id'
+        retrieve_args = mock_retrieve.call_args.args[0]
+        assert retrieve_args.msgid == 'cover@example.com'
+        conn = review_tracking.get_db('track-msgid-test')
+        row = conn.execute('SELECT message_id, revision FROM series').fetchone()
+        conn.close()
+        assert row['message_id'] == 'cover@example.com'
+        assert row['revision'] == 1
+
     @pytest.mark.parametrize(
         'all_present,expect_warning',
         [
