@@ -817,10 +817,13 @@ in the patch selection dialog.
 **Follow-up messages**
 
 Press ``f`` to load and display follow-up messages for the series being
-reviewed. B4 first checks the locally cached thread (stored as a git
-blob in the review branch); if no local copy exists, it fetches from
-lore in the background. The ``f`` key is a toggle — pressing it again
-hides the follow-up display.
+reviewed. B4 first displays the locally cached thread, if available,
+then fetches updates from lore in the background. New replies are added
+to the open follow-up display. If the refresh fails, cached messages
+remain visible and b4 warns that they may be out of date. Refreshed
+messages are kept for the current review session; the stored thread in
+the review branch is not changed. The ``f`` key is a toggle — pressing
+it again hides the follow-up display.
 
 Press ``F`` to open follow-ups as a threaded list, or to switch an open
 chronological list to threaded order. Press ``F`` again to hide the list.
