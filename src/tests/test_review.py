@@ -4636,6 +4636,8 @@ def test_update_all_tracking_fetches_upstream_once(
         'https://lore.example/r/%s',
         topdir='/repo',
         series_list=series,
+        upstream_repo='configured-upstream',
+        upstream_branch='staging',
     )
 
     fetch.assert_called_once_with('/repo', 'repo', '2025-03-01', 'staging')
@@ -4659,7 +4661,20 @@ def test_resolve_upstream_branch_prefers_available_branch(
             gitdir, ['update-ref', f'refs/heads/{branch}', 'HEAD']
         )
         assert ecode == 0
-    assert _review._resolve_upstream_branch(gitdir, gitdir) == expected
+    assert _review._resolve_upstream_branch(gitdir, gitdir, None) == expected
+
+
+def test_resolve_upstream_branch_falls_back_to_remote_head(
+    gitdir: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    git = mock.Mock(return_value=(0, ''))
+    monkeypatch.setattr(b4, 'git_run_command', git)
+    assert _review._resolve_upstream_branch(gitdir, 'selected-repo', None) == 'HEAD'
+    git.assert_called_once_with(
+        gitdir,
+        ['ls-remote', '--heads', 'selected-repo', 'staging', 'main', 'master'],
+        logstderr=True,
+    )
 
 
 def test_upstream_head_fetches_remote_default_branch(gitdir: str) -> None:
@@ -4671,18 +4686,39 @@ def test_upstream_head_fetches_remote_default_branch(gitdir: str) -> None:
     assert ecode == 0
     for branch in ('staging', 'main', 'master'):
         b4.git_run_command(gitdir, ['update-ref', '-d', f'refs/heads/{branch}'])
-    branch = _review._resolve_upstream_branch(gitdir, gitdir)
+    branch = _review._resolve_upstream_branch(gitdir, gitdir, None)
     assert branch == 'HEAD'
     assert _review._fetch_upstream_commits(gitdir, gitdir, '1970-01-01', branch)
 
 
-def test_resolve_upstream_branch_reports_lookup_failure(
+def test_resolve_upstream_branch_explicit_and_failed_lookup(
     gitdir: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     git = mock.Mock(return_value=(1, 'repository unavailable'))
     monkeypatch.setattr(b4, 'git_run_command', git)
+    assert _review._resolve_upstream_branch(gitdir, 'selected-repo', 'next') == 'next'
+    git.assert_not_called()
     with pytest.raises(RuntimeError, match='repository unavailable'):
-        _review._resolve_upstream_branch(gitdir, 'selected-repo')
+        _review._resolve_upstream_branch(gitdir, 'selected-repo', None)
+
+
+def test_update_all_tracking_can_disable_upstream_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(b4.review.tracking, 'rescan_branches', lambda *args: {})
+    resolve = mock.Mock(side_effect=AssertionError('unexpected upstream lookup'))
+    monkeypatch.setattr(_review, '_resolve_upstream_repository', resolve)
+    monkeypatch.setattr(review, 'update_series_tracking', lambda *args, **kwargs: {})
+    result = review.update_all_tracking(
+        'upstream-disabled',
+        'https://example.com/%s',
+        topdir='/repo',
+        series_list=[{'change_id': 'a', 'subject': 'a'}],
+        upstream_repo='None',
+    )
+    resolve.assert_not_called()
+    assert result['upstream_merge_error'] is None
+    assert result['series_checked'] == 1
 
 
 def test_update_all_tracking_continues_when_upstream_fetch_fails(
@@ -4725,12 +4761,24 @@ def test_update_all_tracking_continues_when_upstream_fetch_fails(
     assert result['series_checked'] == 1
 
 
+def test_resolve_upstream_repository_prefers_configured_remote(gitdir: str) -> None:
+    remote_url = 'https://example.com/project/upstream.git'
+    ecode, _out = b4.git_run_command(
+        gitdir, ['remote', 'add', 'project-upstream', remote_url]
+    )
+    assert ecode == 0
+
+    assert (
+        _review._resolve_upstream_repository(gitdir, 'project-upstream') == remote_url
+    )
+
+
 def test_resolve_upstream_repository_uses_upstream_remote(gitdir: str) -> None:
     remote_url = 'https://example.com/project/upstream.git'
     ecode, _out = b4.git_run_command(gitdir, ['remote', 'add', 'upstream', remote_url])
     assert ecode == 0
 
-    assert _review._resolve_upstream_repository(gitdir) == remote_url
+    assert _review._resolve_upstream_repository(gitdir, None) == remote_url
 
 
 def test_resolve_upstream_repository_discovers_github_parent(gitdir: str) -> None:
@@ -4747,7 +4795,7 @@ def test_resolve_upstream_repository_discovers_github_parent(gitdir: str) -> Non
         'get_requests_session',
         return_value=mock.Mock(get=mock.Mock(return_value=response)),
     ) as get_session:
-        repository = _review._resolve_upstream_repository(gitdir)
+        repository = _review._resolve_upstream_repository(gitdir, None)
 
     assert repository == 'https://github.com/project-org/project.git'
     get_session.return_value.get.assert_called_once_with(
@@ -4765,7 +4813,7 @@ def test_resolve_upstream_repository_uses_non_fork_github_origin(gitdir: str) ->
     with mock.patch.object(
         b4, 'get_requests_session', return_value=mock.Mock(get=mock.Mock(return_value=response))
     ):
-        assert _review._resolve_upstream_repository(gitdir) == origin
+        assert _review._resolve_upstream_repository(gitdir, None) == origin
 
 
 def test_update_all_tracking_counts_upstream(
