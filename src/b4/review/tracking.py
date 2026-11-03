@@ -28,7 +28,7 @@ logger = b4.logger
 REVIEW_METADATA_DIR = 'b4-review'
 REVIEW_METADATA_FILE = 'metadata.json'
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 
 SERIES_PATCHES_DDL = """
 CREATE TABLE IF NOT EXISTS series_patches (
@@ -37,6 +37,8 @@ CREATE TABLE IF NOT EXISTS series_patches (
     position   INTEGER NOT NULL,
     message_id TEXT NOT NULL,
     subject    TEXT,
+    patch_id   TEXT,
+    merged_commit TEXT,
     PRIMARY KEY (change_id, revision, position)
 )"""
 
@@ -200,6 +202,13 @@ def _migrate_db_if_needed(conn: sqlite3.Connection) -> None:
             conn.execute(
                 'ALTER TABLE revisions ADD COLUMN is_rethreaded INTEGER DEFAULT 0'
             )
+    if version < 11:
+        conn.execute(SERIES_PATCHES_DDL)
+        existing = {row[1] for row in conn.execute('PRAGMA table_info(series_patches)')}
+        if 'patch_id' not in existing:
+            conn.execute('ALTER TABLE series_patches ADD COLUMN patch_id TEXT')
+        if 'merged_commit' not in existing:
+            conn.execute('ALTER TABLE series_patches ADD COLUMN merged_commit TEXT')
     conn.execute('UPDATE schema_version SET version = ?', (SCHEMA_VERSION,))
     conn.commit()
 
@@ -1218,7 +1227,8 @@ def get_all_tracked_series(identifier: str) -> list[dict[str, Any]]:
 
     Returns a list of dicts with keys: track_id, change_id, revision, subject,
     sender_name, sender_email, sent_at, added_at, status, num_patches,
-    message_id, pw_series_id, message_count, seen_message_count.
+    message_id, pw_series_id, message_count, seen_message_count,
+    merged_patch_positions, merged_patch_count.
 
     The ``attestation`` field carries the live trust-on-first-use status
     of each signature, and ``tofu`` its details (see
@@ -1262,6 +1272,20 @@ def get_all_tracked_series(identifier: str) -> list[dict[str, Any]]:
                     'snoozed_until': row[18],
                 }
             )
+        merged_positions: Dict[Tuple[str, int], List[int]] = {}
+        for change_id, revision, position in conn.execute(
+            'SELECT change_id, revision, position FROM series_patches'
+            ' WHERE position > 0 AND merged_commit IS NOT NULL'
+        ):
+            merged_positions.setdefault((change_id, int(revision)), []).append(
+                int(position)
+            )
+        for entry in result:
+            positions = merged_positions.get(
+                (entry['change_id'], int(entry['revision'])), []
+            )
+            entry['merged_patch_positions'] = positions
+            entry['merged_patch_count'] = len(positions)
         try:
             _resolve_attestation(conn, result)
         except Exception as ex:
@@ -1495,13 +1519,32 @@ def get_series_patches(
     conn: sqlite3.Connection, change_id: str, revision: int
 ) -> List[Dict[str, Any]]:
     """Return the stored patches for a series, ordered by position."""
-    cols = ('position', 'message_id', 'subject')
+    cols = ('position', 'message_id', 'subject', 'patch_id', 'merged_commit')
     cursor = conn.execute(
-        'SELECT position, message_id, subject FROM series_patches'
+        'SELECT position, message_id, subject, patch_id, merged_commit'
+        ' FROM series_patches'
         ' WHERE change_id = ? AND revision = ? ORDER BY position ASC',
         (change_id, revision),
     )
     return [dict(zip(cols, row)) for row in cursor.fetchall()]
+
+
+def set_series_patch_merge_status(
+    conn: sqlite3.Connection,
+    change_id: str,
+    revision: int,
+    patch_status: Dict[int, Tuple[Optional[str], Optional[str]]],
+) -> None:
+    """Update patch IDs and upstream matches for identifiable positions."""
+    conn.executemany(
+        'UPDATE series_patches SET patch_id = ?, merged_commit = ?'
+        ' WHERE change_id = ? AND revision = ? AND position = ?',
+        [
+            (patch_id, merged_commit, change_id, revision, position)
+            for position, (patch_id, merged_commit) in patch_status.items()
+        ],
+    )
+    conn.commit()
 
 
 def build_known_revisions(
@@ -2726,6 +2769,10 @@ def _store_thread_blob(topdir: str, change_id: str, msgs: List[Any]) -> Optional
 
     import b4.review as _b4_review
 
+    branch_name = f'b4/review/{change_id}'
+    if b4.git_branch_checked_out(topdir, branch_name):
+        return None
+
     buf = io.BytesIO()
     b4.save_mboxrd_mbox(msgs, buf)
     mbox_bytes = buf.getvalue()
@@ -2741,7 +2788,6 @@ def _store_thread_blob(topdir: str, change_id: str, msgs: List[Any]) -> Optional
         return None
     blob_sha = out.strip()
 
-    branch_name = f'b4/review/{change_id}'
     if b4.git_branch_exists(topdir, branch_name):
         try:
             cover_text, tracking = _b4_review.load_tracking(topdir, branch_name)
@@ -3256,7 +3302,7 @@ def rescan_branches(
 
         # Check the stored SHA for the most recent revision of this change_id.
         stored = conn.execute(
-            'SELECT branch_sha FROM series WHERE change_id = ?'
+            'SELECT branch_sha, status, revision FROM series WHERE change_id = ?'
             ' ORDER BY revision DESC LIMIT 1',
             (change_id_from_branch,),
         ).fetchone()
@@ -3293,6 +3339,24 @@ def rescan_branches(
         scanned_change_ids.add(change_id)
         status = series.get('status', 'reviewing')
         revision = series.get('revision', 1)
+        merged_commits = series.get('merged-commits', {})
+        if (
+            stored
+            and stored['revision'] == revision
+            and b4.git_branch_checked_out(topdir, br)
+        ):
+            if stored['status'] == 'merged' and status not in (
+                'snoozed',
+                'gone',
+                'archived',
+            ):
+                status = 'merged'
+            if not merged_commits:
+                merged_commits = {
+                    str(patch['position']): patch['merged_commit']
+                    for patch in get_series_patches(conn, change_id, revision)
+                    if patch['merged_commit'] is not None
+                }
 
         # Parse sent date from header-info
         sent_at = None
@@ -3335,11 +3399,21 @@ def rescan_branches(
             for i, p in enumerate(tracking_patches, 1):
                 p_msgid = p.get('header-info', {}).get('msgid', '')
                 if p_msgid:
-                    rows.append((change_id, revision, i, p_msgid, p.get('title', '')))
+                    rows.append(
+                        (
+                            change_id,
+                            revision,
+                            i,
+                            p_msgid,
+                            p.get('title', ''),
+                            merged_commits.get(str(i)),
+                        )
+                    )
             if rows:
                 conn.executemany(
-                    'INSERT INTO series_patches (change_id, revision, position, message_id, subject)'
-                    ' VALUES (?, ?, ?, ?, ?)',
+                    'INSERT INTO series_patches'
+                    ' (change_id, revision, position, message_id, subject, merged_commit)'
+                    ' VALUES (?, ?, ?, ?, ?, ?)',
                     rows,
                 )
                 conn.commit()
