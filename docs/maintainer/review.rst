@@ -912,6 +912,10 @@ B4 uses an ``upstream`` remote or discovers the parent of a GitHub
 falling back to the remote's ``HEAD`` (normally its default branch). A
 failed lookup or fetch leaves the previous indicators unchanged.
 
+Set :term:`b4.upstream-repo` to choose a different repository, or to
+``none`` to disable upstream merge checks. Set :term:`b4.upstream-branch`
+to select a branch explicitly.
+
 Upgrading itself is always an explicit action: open the action menu
 (``a``) and select **Upgrade**. Availability depends only on a newer
 revision being known — the series can be in reviewing, replied,
