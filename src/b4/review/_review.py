@@ -49,6 +49,40 @@ NO_COVER_NOTE = 'NOTE: No cover letter provided by the author.'
 _REPLY_CONTEXT_LINES = 5
 
 
+class UpstreamCommit(NamedTuple):
+    commit: str
+    author_name: str
+    author_email: str
+    committed_at: int
+
+
+def _match_upstream_commit(
+    patch: b4.LoreMessage, upstream_commits: Dict[str, List[UpstreamCommit]]
+) -> Optional[str]:
+    candidates = upstream_commits.get(patch.subject, [])
+    if not candidates or not patch.msg.get('Date'):
+        return None
+    try:
+        sent_at = email.utils.parsedate_to_datetime(str(patch.msg['Date']))
+    except (TypeError, ValueError):
+        return None
+    if sent_at.tzinfo is None:
+        sent_at = sent_at.replace(tzinfo=datetime.timezone.utc)
+    info, _message, _diff = b4.get_mailinfo(
+        patch.msg.as_bytes(policy=b4.emlpolicy), scissors=False
+    )
+    author_email = info.get('Email', '')
+    if not author_email:
+        return None
+    for commit in candidates:
+        if (
+            commit.author_email.casefold() == author_email.casefold()
+            and commit.committed_at >= sent_at.timestamp()
+        ):
+            return commit.commit
+    return None
+
+
 def _strip_subject(text: str) -> List[str]:
     """Return the body lines of a commit/cover message.
 
@@ -2578,11 +2612,12 @@ def update_series_tracking(
     identifier: str,
     linkmask: str,
     topdir: Optional[str] = None,
+    upstream_commits: Optional[Dict[str, List[UpstreamCommit]]] = None,
 ) -> Dict[str, Any]:
     """Fetch thread, discover revisions, update trailers for one series.
 
-    Returns {'new_revisions': int, 'new_trailers': int,
-             'error': Optional[str]}.
+    Returns discovered revision/trailer counts and an optional error. When an
+    upstream commit map is supplied, also returns ``merged_patches``.
     """
     result: Dict[str, Any] = {
         'new_revisions': 0,
@@ -2722,6 +2757,49 @@ def update_series_tracking(
         att = check_series_attestation(lser_att)
         b4.review.tracking.update_attestation(identifier, change_id, current_rev, att)
 
+    merge_status: Optional[Dict[int, Tuple[Optional[str], Optional[str]]]] = None
+    fully_merged = False
+    if upstream_commits is not None and lser is not None and lser.complete:
+        patch_status: Dict[int, Tuple[Optional[str], Optional[str]]] = {}
+        matching_prefix = True
+        for position, patch in enumerate(lser.patches[1:], start=1):
+            commit = (
+                _match_upstream_commit(patch, upstream_commits)
+                if patch is not None and matching_prefix
+                else None
+            )
+            matching_prefix = matching_prefix and commit is not None
+            patch_status[position] = (None, commit)
+        merged_count = sum(1 for _patch_id, commit in patch_status.values() if commit)
+        fully_merged = merged_count == lser.expected and lser.expected > 0
+        try:
+            conn = b4.review.tracking.get_db(identifier)
+            if not b4.review.tracking.get_series_patches(conn, change_id, current_rev):
+                b4.review.tracking.add_series_patches(
+                    conn, change_id, current_rev, lser
+                )
+            b4.review.tracking.set_series_patch_merge_status(
+                conn, change_id, current_rev, patch_status
+            )
+            if fully_merged:
+                current_status = conn.execute(
+                    'SELECT status FROM series WHERE change_id = ? AND revision = ?',
+                    (change_id, current_rev),
+                ).fetchone()
+                if current_status and current_status['status'] not in (
+                    'snoozed',
+                    'gone',
+                    'archived',
+                ):
+                    b4.review.tracking.update_series_status(
+                        conn, change_id, 'merged', revision=current_rev
+                    )
+            conn.close()
+            merge_status = patch_status
+            result['merged_patches'] = merged_count
+        except Exception as ex:
+            logger.warning('Could not update upstream merge status: %s', ex)
+
     # Record all discovered revisions in SQLite through the shared helper, so
     # a revision is identified by its cover letter when the author sent one.
     # Recording them here by hand picked the first present patch of the raw,
@@ -2748,8 +2826,8 @@ def update_series_tracking(
     # Note: [u]pdate deliberately does NOT mutate a waiting series' status.
     # Discovering a newer version records it (above) and lights up the
     # has_newer signal, which the UI surfaces and the upgrade action acts on
-    # explicitly; status is only ever changed by an explicit user action, not
-    # as a side effect of updating.  Do not re-add auto-promotion here.
+    # explicitly. Upstream merge detection is separate: a fully merged
+    # tracked revision can move to merged without upgrading it.
 
     if update_branch and topdir:
         wantver = current_rev
@@ -2890,6 +2968,25 @@ def update_series_tracking(
         except Exception as ex:
             logger.warning('Could not update message counts: %s', ex)
 
+    if merge_status is not None and topdir and b4.git_branch_exists(topdir, branch):
+        if not b4.git_branch_checked_out(topdir, branch):
+            try:
+                cover_text, tracking = load_tracking(topdir, branch)
+                t_series = tracking['series']
+                previous = dict(t_series)
+                t_series['merged-commits'] = {
+                    str(position): commit
+                    for position, (_patch_id, commit) in merge_status.items()
+                    if commit is not None
+                }
+                if fully_merged and status not in ('snoozed', 'gone', 'archived'):
+                    t_series['status'] = 'merged'
+                if previous != t_series:
+                    if not save_tracking_ref(topdir, branch, cover_text, tracking):
+                        result['error'] = 'Error saving upstream merge status'
+            except (Exception, SystemExit) as ex:
+                result['error'] = f'Could not save upstream merge status: {ex}'
+
     return result
 
 
@@ -2901,6 +2998,98 @@ def _get_update_lock_path(identifier: str) -> str:
     """
     reviewdir = b4.review.tracking.get_review_data_dir()
     return os.path.join(reviewdir, f'{identifier}.update.lock')
+
+
+def _resolve_upstream_repository(topdir: str) -> str:
+    """Resolve an upstream URL, remote name, or GitHub origin's parent URL."""
+    remotes = b4.git_get_command_lines(topdir, ['remote'])
+    if 'upstream' in remotes:
+        ecode, url = b4.git_run_command(topdir, ['remote', 'get-url', 'upstream'])
+        if ecode == 0 and url.strip():
+            return url.strip()
+
+    if 'origin' not in remotes:
+        raise RuntimeError('No upstream remote or origin remote')
+    ecode, origin = b4.git_run_command(topdir, ['remote', 'get-url', 'origin'])
+    if ecode != 0:
+        raise RuntimeError('Could not resolve origin remote')
+    location = b4.parse_repo_location(origin.strip())
+    if not location or location[0] != 'github.com':
+        raise RuntimeError('Cannot discover a parent repository for this origin')
+    repo_path = location[1].strip('/').removesuffix('.git')
+    try:
+        response = b4.get_requests_session().get(
+            f'https://api.github.com/repos/{repo_path}', timeout=(3, 10)
+        )
+        response.raise_for_status()
+        parent_info = response.json().get('parent') or {}
+        parent = parent_info.get('full_name')
+    except Exception as ex:
+        raise RuntimeError(f'Could not discover the GitHub parent: {ex}') from ex
+    if not parent:
+        return origin.strip()
+    return f'https://github.com/{parent}.git'
+
+
+def _resolve_upstream_branch(topdir: str, repository: str) -> str:
+    """Resolve the branch to scan in the selected upstream repository."""
+    ecode, output = b4.git_run_command(
+        topdir,
+        ['ls-remote', '--heads', repository, 'staging', 'main', 'master'],
+        logstderr=True,
+    )
+    if ecode != 0:
+        raise RuntimeError(output.strip() or 'Could not list upstream branches')
+    refs = {line.split()[-1] for line in output.splitlines() if line.split()}
+    for branch in ('staging', 'main', 'master'):
+        if f'refs/heads/{branch}' in refs:
+            return branch
+    # Git resolves the remote's symbolic HEAD to its default branch on fetch.
+    return 'HEAD'
+
+
+def _fetch_upstream_commits(
+    topdir: str, repository: str, since: str, branch: str = 'HEAD'
+) -> Dict[str, List[UpstreamCommit]]:
+    """Fetch the upstream branch and index commit metadata by subject."""
+    ref = 'refs/b4/upstream-merge-check'
+    ecode, output = b4.git_run_command(
+        topdir,
+        [
+            'fetch',
+            '--quiet',
+            '--no-tags',
+            '--no-write-fetch-head',
+            '--no-recurse-submodules',
+            f'--shallow-since={since}',
+            repository,
+            f'+{branch}:{ref}',
+        ],
+        logstderr=True,
+    )
+    if ecode != 0:
+        raise RuntimeError(output.strip() or 'git fetch failed')
+
+    ecode, output = b4.git_run_command(
+        topdir,
+        [
+            'log',
+            '--no-merges',
+            f'--since={since}',
+            '--format=%H%x00%an%x00%ae%x00%ct%x00%s',
+            ref,
+            '--',
+        ],
+    )
+    if ecode != 0:
+        raise RuntimeError(output.strip() or 'Could not read fetched upstream history')
+    matches: Dict[str, List[UpstreamCommit]] = {}
+    for line in output.splitlines():
+        commit, name, address, committed_at, subject = line.split('\x00', 4)
+        matches.setdefault(subject, []).append(
+            UpstreamCommit(commit, name, address, int(committed_at))
+        )
+    return matches
 
 
 def update_all_tracking(
@@ -2926,7 +3115,8 @@ def update_all_tracking(
 
     Returns a summary dict with keys: series_checked, series_updated,
     errors, gone, followup_updated, checked_out_skipped, upstream,
-    error_details, cancelled.  ``upstream`` counts the series that
+    error_details, cancelled, merged_patches, upstream_merge_error.
+    ``upstream`` counts the series that
     needed at least one answer from the upstream archive of a partial
     mirror (b4.midmask), because the mirror did not have them.
     """
@@ -2940,6 +3130,8 @@ def update_all_tracking(
         'upstream': 0,
         'error_details': [],
         'cancelled': False,
+        'merged_patches': 0,
+        'upstream_merge_error': None,
     }
 
     with b4.lockfile_nb(_get_update_lock_path(identifier)):
@@ -2959,6 +3151,24 @@ def update_all_tracking(
                 if s.get('status') not in ('snoozed', 'archived')
             ]
 
+        upstream_commits: Optional[Dict[str, List[UpstreamCommit]]] = None
+        if topdir and series_list:
+            try:
+                repository = _resolve_upstream_repository(topdir)
+                branch = _resolve_upstream_branch(topdir, repository)
+                oldest_sent = min(
+                    datetime.date.fromisoformat(
+                        str(series.get('sent_at') or '1970-01-01')[:10]
+                    )
+                    for series in series_list
+                )
+                since = (oldest_sent - datetime.timedelta(days=365)).isoformat()
+                upstream_commits = _fetch_upstream_commits(
+                    topdir, repository, since, branch
+                )
+            except Exception as ex:
+                result['upstream_merge_error'] = str(ex)
+
         total = len(series_list)
         for i, series in enumerate(series_list):
             if cancel_cb and cancel_cb():
@@ -2972,9 +3182,16 @@ def update_all_tracking(
             try:
                 # Called via the package attribute: it is the established
                 # patch seam for tests and TUI callers alike
+                update_kwargs = {}
+                if upstream_commits is not None:
+                    update_kwargs['upstream_commits'] = upstream_commits
                 with b4.track_lore_sources() as sources:
                     r = b4.review.update_series_tracking(
-                        series, identifier, linkmask, topdir=topdir
+                        series,
+                        identifier,
+                        linkmask,
+                        topdir=topdir,
+                        **update_kwargs,
                     )
             except liblore.OperationCancelledError:
                 result['cancelled'] = True
@@ -2992,6 +3209,7 @@ def update_all_tracking(
                 result['checked_out_skipped'] += 1
             if r.get('counts_updated'):
                 result['followup_updated'] += 1
+            result['merged_patches'] += r.get('merged_patches', 0)
 
             if progress_cb:
                 progress_cb(i + 1, total, subject)

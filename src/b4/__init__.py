@@ -256,6 +256,7 @@ REVIEW_SERIES_STATUSES: Tuple[str, ...] = (
     'queued',
     'snoozed',
     'thanked',
+    'merged',
     'gone',
     'archived',
 )
