@@ -134,6 +134,7 @@ _STATUS_SYMBOLS: Dict[str, str] = {
     'queued': '◷',  # U+25F7 white circle with upper right quadrant
     'snoozed': '⏸',  # U+23F8 double vertical bar
     'thanked': '✓',  # U+2713 check mark
+    'merged': '✔',  # U+2714 check mark; upstream-merged series
     'gone': 'ø',  # U+00F8 latin small letter o with stroke
 }
 
@@ -151,6 +152,7 @@ _STATUS_TIER: Dict[str, int] = {
     'snoozed': 2,
     'waiting': 2,
     'thanked': 2,
+    'merged': 2,
     'gone': 2,
 }
 
@@ -1003,7 +1005,9 @@ class TrackedSeriesItem(ListItem):
             f'{msgs_badge:<{self.msgs_badge_w}s}' if self.msgs_badge_w else '',
             style=accent if msgs_badge else '',
         )
-        label.append(f'  {symbol}{flag}  ')
+        label.append('  ')
+        label.append(symbol, style='#a855f7' if effective == 'merged' else '')
+        label.append(f'{flag}  ')
         label.append(prefix_head)
         label.append(ver_token, style=accent if ver_accent else '')
         label.append(prefix_tail)
@@ -1247,6 +1251,9 @@ class TrackingApp(LoreNodeShutdownMixin, CheckRunnerMixin, App[Optional[str]]):
             with Horizontal(classes='details-row', id='detail-attestation-row'):
                 yield Static('Attestation:', classes='details-label')
                 yield Static('', id='detail-attestation')
+            with Horizontal(classes='details-row', id='detail-merged-row'):
+                yield Static('Merged:', classes='details-label')
+                yield Static('', id='detail-merged', markup=False)
             with Horizontal(classes='details-row'):
                 yield Static('Sent:', classes='details-label')
                 yield Static('', id='detail-sent', markup=False)
@@ -2509,6 +2516,19 @@ class TrackingApp(LoreNodeShutdownMixin, CheckRunnerMixin, App[Optional[str]]):
             else:
                 att_row.display = False
 
+        merged_count = series.get('merged_patch_count', 0)
+        merged_row = self.query_one('#detail-merged-row', Horizontal)
+        merged_row.display = merged_count > 0
+        if merged_count:
+            total_patches = series.get('num_patches', 0) or 0
+            merged_positions = ', '.join(
+                str(position) for position in series.get('merged_patch_positions', [])
+            )
+            patch_label = 'patch' if merged_count == 1 else 'patches'
+            self.query_one('#detail-merged', Static).update(
+                f'{patch_label} {merged_positions} of {total_patches} merged upstream'
+            )
+
         # Show known revisions (precomputed in _load_series)
         revisions_row = self.query_one('#detail-revisions-row', Horizontal)
         revs = series.get('_revisions', [])
@@ -2711,7 +2731,10 @@ class TrackingApp(LoreNodeShutdownMixin, CheckRunnerMixin, App[Optional[str]]):
         self._focus_change_id = self._selected_series.get('change_id')
         self.push_screen(
             UpdateAllScreen(
-                [self._selected_series], self._identifier, linkmask, topdir
+                [self._selected_series],
+                self._identifier,
+                linkmask,
+                topdir,
             ),
             callback=self._on_update_complete,
         )
@@ -2732,7 +2755,12 @@ class TrackingApp(LoreNodeShutdownMixin, CheckRunnerMixin, App[Optional[str]]):
         if self._selected_series:
             self._focus_change_id = self._selected_series.get('change_id')
         self.push_screen(
-            UpdateAllScreen(update_list, self._identifier, linkmask, topdir),
+            UpdateAllScreen(
+                update_list,
+                self._identifier,
+                linkmask,
+                topdir,
+            ),
             callback=self._on_update_complete,
         )
 
@@ -2760,6 +2788,9 @@ class TrackingApp(LoreNodeShutdownMixin, CheckRunnerMixin, App[Optional[str]]):
             parts.append(f'{updated} updated')
         if errors:
             parts.append(f'{errors} error(s)')
+        merged_patches = result.get('merged_patches', 0)
+        if merged_patches:
+            parts.append(f'{merged_patches} merged patch(es) on upstream')
         skipped = result.get('checked_out_skipped', 0)
         if skipped:
             parts.append(f'{skipped} checked-out branch(es) left alone')
@@ -2768,6 +2799,12 @@ class TrackingApp(LoreNodeShutdownMixin, CheckRunnerMixin, App[Optional[str]]):
             'warning' if errors else 'information'
         )
         self.notify(', '.join(parts), severity=severity)
+        upstream_merge_error = result.get('upstream_merge_error')
+        if upstream_merge_error:
+            self.notify(
+                f'Could not check upstream merges: {upstream_merge_error}',
+                severity='warning',
+            )
         upstream = result.get('upstream', 0)
         if upstream:
             # A partial mirror sends what it lacks upstream, and each of
