@@ -374,6 +374,47 @@ class TestFollowupSelection:
             compose.assert_called_once_with(entries[1])
 
 
+class TestFollowupReload:
+    @pytest.mark.parametrize('uppercase', [False, True])
+    def test_inline_import_preserves_own_draft(
+        self, gitdir: str, uppercase: bool
+    ) -> None:
+        branch, _shas = _create_review_branch_with_patches(
+            gitdir, 'followup-own-inline', ['patch 1']
+        )
+        app = ReviewApp(_build_session(gitdir, branch))
+        email_addr = str(app._usercfg['email'])
+        draft = [{'path': 'foo.c', 'line': 1, 'text': 'My unsent draft'}]
+        app._patches[0]['reviews'] = {email_addr: {'comments': draft}}
+        followups = {
+            1: [
+                {
+                    'fromemail': email_addr.upper() if uppercase else email_addr,
+                    'msgid': 'mine@example.com',
+                    'body': '> diff --git a/foo.c b/foo.c\n\nEarlier feedback.',
+                },
+                {
+                    'fromemail': 'other@example.com',
+                    'msgid': 'other@example.com',
+                    'body': '> diff --git a/foo.c b/foo.c\n\nExternal feedback.',
+                },
+            ]
+        }
+        external = [{'path': 'foo.c', 'line': 2, 'text': 'External feedback'}]
+        with (
+            mock.patch(
+                'b4.review._extract_comments_from_quoted_reply', return_value=external
+            ),
+            mock.patch('b4.review._resolve_comment_positions'),
+            mock.patch.object(app, '_save_tracking', return_value=True) as save,
+        ):
+            assert app._integrate_followup_inline(followups) == 1
+        assert app._patches[0]['reviews'][email_addr]['comments'] == draft
+        assert app._patches[0]['reviews']['other@example.com']['comments'] == external
+        assert len(app._patches[0]['reviews']) == 2
+        save.assert_called_once()
+
+
 class TestFollowupTree:
     def test_tree_keeps_orphans_and_breaks_cycles(self, gitdir: str) -> None:
         branch, _shas = _create_review_branch_with_patches(

@@ -2162,6 +2162,11 @@ class ReviewApp(LoreNodeShutdownMixin, CheckRunnerMixin, App[None]):
                 reviewer_email = fc.get('fromemail', '')
                 if not reviewer_email:
                     continue
+                if (
+                    reviewer_email.casefold()
+                    == str(self._usercfg.get('email', '')).casefold()
+                ):
+                    continue
 
                 fc_msgid = fc.get('msgid', '')
                 existing_entry = patch.get('reviews', {}).get(reviewer_email, {})
