@@ -21,7 +21,7 @@ import pytest
 
 pytest.importorskip('textual')
 
-from textual.widgets import ListView
+from textual.widgets import ListView, RichLog
 
 import b4
 import b4.review
@@ -413,6 +413,78 @@ class TestFollowupReload:
         assert app._patches[0]['reviews']['other@example.com']['comments'] == external
         assert len(app._patches[0]['reviews']) == 2
         save.assert_called_once()
+
+    @pytest.mark.parametrize('select_followup', [False, True])
+    @pytest.mark.asyncio
+    async def test_reload_preserves_selection_and_scroll(
+        self, gitdir: str, select_followup: bool
+    ) -> None:
+        change_id = 'followup-reload'
+        branch, _shas = _create_review_branch_with_patches(
+            gitdir,
+            change_id,
+            ['patch 1'],
+            series_extra={'header-info': {'msgid': 'cover@example.com'}},
+        )
+        patch_id = f'{change_id}-patch1@example.com'
+        messages = [
+            make_msg('cover@example.com', '[PATCH 0/1] Test series'),
+            make_msg(
+                patch_id,
+                '[PATCH 1/1] patch 1',
+                body=MINIMAL_DIFF,
+                in_reply_to='cover@example.com',
+            ),
+            make_msg(
+                'review@example.com',
+                'Re: [PATCH 1/1] patch 1',
+                body='\n'.join(f'Review line {index}' for index in range(80)),
+                in_reply_to=patch_id,
+            ),
+        ]
+        app = ReviewApp(_build_session(gitdir, branch))
+        async with app.run_test(size=(120, 30)) as pilot:
+            app._show_external_comments = True
+            app._load_followup_msgs(messages)
+            await pilot.pause()
+            patch_list = app.query_one('#patch-list', ListView)
+            item = next(
+                child
+                for child in patch_list.children
+                if (
+                    isinstance(child, FollowupItem)
+                    if select_followup
+                    else isinstance(child, PatchListItem) and child.patch_idx == 1
+                )
+            )
+            patch_list.index = patch_list.children.index(item)
+            await pilot.pause()
+            viewer = app.query_one('#diff-viewer', RichLog)
+            position = app._followup_positions['review@example.com']
+            viewer.scroll_to(y=position + 10 if select_followup else 20, animate=False)
+            await pilot.pause()
+            before = viewer.scroll_y
+            assert before > 0
+            visible_line = viewer.lines[int(before)].text
+            earlier = make_msg(
+                'earlier@example.com',
+                'Re: [PATCH 1/1] patch 1',
+                date='Mon, 23 Mar 2026 11:00:00 +0000',
+                body='An earlier review.\n',
+                in_reply_to=patch_id,
+            )
+            app.call_later(app._load_followup_msgs, messages + [earlier])
+            await pilot.pause()
+            new_position = app._followup_positions['review@example.com']
+            assert new_position > position
+            assert viewer.scroll_y == before + (
+                new_position - position if select_followup else 0
+            )
+            if select_followup:
+                assert viewer.lines[int(viewer.scroll_y)].text == visible_line
+            assert _selected_followup(app) == (
+                'review@example.com' if select_followup else None
+            )
 
 
 class TestFollowupTree:
