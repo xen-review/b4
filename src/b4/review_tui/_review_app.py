@@ -1094,9 +1094,14 @@ class ReviewApp(LoreNodeShutdownMixin, CheckRunnerMixin, App[None]):
         """Handle patch highlight change in the list view."""
         item = event.item
         if isinstance(item, PatchListItem):
-            self._show_content(item.patch_idx)
+            if item.patch_idx != self._selected_idx or self._selected_followup_msgid:
+                self._show_content(item.patch_idx)
         elif isinstance(item, FollowupItem):
-            self._show_followup_item(item)
+            if (
+                item.display_idx != self._selected_idx
+                or item.msgid != self._selected_followup_msgid
+            ):
+                self._show_followup_item(item)
 
     def _show_followup_item(self, item: 'FollowupItem') -> None:
         """Show the parent patch for a follow-up item and scroll to its comment."""
@@ -2016,6 +2021,10 @@ class ReviewApp(LoreNodeShutdownMixin, CheckRunnerMixin, App[None]):
     def _load_followup_msgs(self, msgs: List[Any]) -> None:
         """Parse msgs into follow-up comments and refresh the display."""
         cover_msgid = self._series.get('header-info', {}).get('msgid')
+        selected_followup = self._selected_followup_msgid
+        viewer = self.query_one('#diff-viewer', RichLog)
+        scroll_x, scroll_y = viewer.scroll_x, viewer.scroll_y
+        old_followup_position = self._followup_positions.get(selected_followup or '')
 
         # Minimise for body parsing (strips deep quoting, signatures)
         minimised = b4.mbox.minimize_thread(list(msgs))
@@ -2124,6 +2133,13 @@ class ReviewApp(LoreNodeShutdownMixin, CheckRunnerMixin, App[None]):
             self.notify('No follow-up comments found')
         self._populate_patch_list()
         self._show_content(self._selected_idx)
+        if selected_followup and selected_followup in self._followup_positions:
+            self._selected_followup_msgid = selected_followup
+            if old_followup_position is not None:
+                scroll_y += (
+                    self._followup_positions[selected_followup] - old_followup_position
+                )
+        viewer.scroll_to(x=scroll_x, y=scroll_y, animate=False)
 
     def _integrate_followup_inline(
         self,
