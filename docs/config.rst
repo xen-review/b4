@@ -52,6 +52,8 @@ unrestricted:
 - ``*template*`` -- message templates
 - ``trailer*`` -- trailer-handling options
 - ``pw-*`` -- Patchwork integration options
+- ``upstream-repo`` -- the repository used to check merged patches during
+  an explicit review update
 
 The ``prep`` check and recipient-discovery commands are allowed because
 they only run when you explicitly invoke a check or ``--auto-to-cc`` on a
@@ -748,6 +750,35 @@ These settings control ``b4 review`` TUI behaviour.
 
 .. glossary::
    :sorted:
+
+   :term:`b4.upstream-repo`
+     Repository scanned for merged patches when ``b4 review`` updates a
+     tracked submission using ``u`` or ``U``. Specify a Git remote name
+     or a repository URL. Without this setting, b4 uses the ``upstream``
+     remote, or discovers the parent of a GitHub ``origin``.
+    Set it to ``none`` to disable upstream merge checks.
+
+     The branch selected by :term:`b4.upstream-branch` is fetched into a
+     private ref, with history starting one year before the oldest selected
+     series. Existing Git remotes are not added or modified.
+
+     A failed lookup or fetch leaves the last recorded merge indicators
+     unchanged.
+
+     Default: ``None``
+
+     .. versionadded:: v0.17
+
+   :term:`b4.upstream-branch`
+     Branch checked for upstream commits during review updates. Use
+     ``staging`` to detect patches accepted into an upstream staging branch.
+    When unset, b4 checks the selected repository for ``staging``,
+    then ``main``, then ``master``. If none exists, b4 fetches the
+    remote's ``HEAD``, which normally points to its default branch.
+
+     Default: ``None``
+
+     .. versionadded:: v0.17
 
    :term:`b4.review-default-take-method`
      The default take method to pre-select in the Take dialog. Valid

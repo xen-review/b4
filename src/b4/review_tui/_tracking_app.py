@@ -2726,6 +2726,8 @@ class TrackingApp(LoreNodeShutdownMixin, CheckRunnerMixin, App[Optional[str]]):
 
         config = b4.get_main_config()
         linkmask = str(config.get('linkmask', 'https://lore.kernel.org/r/%s'))
+        upstream_repo = config.get('upstream-repo')
+        upstream_branch = config.get('upstream-branch')
         topdir = b4.git_get_toplevel()
 
         self._focus_change_id = self._selected_series.get('change_id')
@@ -2735,6 +2737,8 @@ class TrackingApp(LoreNodeShutdownMixin, CheckRunnerMixin, App[Optional[str]]):
                 self._identifier,
                 linkmask,
                 topdir,
+                str(upstream_repo) if upstream_repo else None,
+                str(upstream_branch) if upstream_branch else None,
             ),
             callback=self._on_update_complete,
         )
@@ -2747,6 +2751,8 @@ class TrackingApp(LoreNodeShutdownMixin, CheckRunnerMixin, App[Optional[str]]):
 
         config = b4.get_main_config()
         linkmask = str(config.get('linkmask', 'https://lore.kernel.org/r/%s'))
+        upstream_repo = config.get('upstream-repo')
+        upstream_branch = config.get('upstream-branch')
         topdir = b4.git_get_toplevel()
 
         # Skip snoozed series during update-all
@@ -2760,6 +2766,8 @@ class TrackingApp(LoreNodeShutdownMixin, CheckRunnerMixin, App[Optional[str]]):
                 self._identifier,
                 linkmask,
                 topdir,
+                str(upstream_repo) if upstream_repo else None,
+                str(upstream_branch) if upstream_branch else None,
             ),
             callback=self._on_update_complete,
         )

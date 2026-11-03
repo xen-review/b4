@@ -3000,8 +3000,17 @@ def _get_update_lock_path(identifier: str) -> str:
     return os.path.join(reviewdir, f'{identifier}.update.lock')
 
 
-def _resolve_upstream_repository(topdir: str) -> str:
+def _resolve_upstream_repository(topdir: str, configured: Optional[str]) -> str:
     """Resolve an upstream URL, remote name, or GitHub origin's parent URL."""
+    if configured:
+        remotes = b4.git_get_command_lines(topdir, ['remote'])
+        if configured in remotes:
+            ecode, url = b4.git_run_command(topdir, ['remote', 'get-url', configured])
+            if ecode != 0:
+                raise RuntimeError(f'Could not resolve remote {configured}')
+            return url.strip()
+        return configured
+
     remotes = b4.git_get_command_lines(topdir, ['remote'])
     if 'upstream' in remotes:
         ecode, url = b4.git_run_command(topdir, ['remote', 'get-url', 'upstream'])
@@ -3009,7 +3018,7 @@ def _resolve_upstream_repository(topdir: str) -> str:
             return url.strip()
 
     if 'origin' not in remotes:
-        raise RuntimeError('No upstream remote or origin remote')
+        raise RuntimeError('No upstream-repo config, upstream remote, or origin remote')
     ecode, origin = b4.git_run_command(topdir, ['remote', 'get-url', 'origin'])
     if ecode != 0:
         raise RuntimeError('Could not resolve origin remote')
@@ -3031,8 +3040,13 @@ def _resolve_upstream_repository(topdir: str) -> str:
     return f'https://github.com/{parent}.git'
 
 
-def _resolve_upstream_branch(topdir: str, repository: str) -> str:
+def _resolve_upstream_branch(
+    topdir: str, repository: str, configured: Optional[str]
+) -> str:
     """Resolve the branch to scan in the selected upstream repository."""
+    if configured:
+        return configured
+
     ecode, output = b4.git_run_command(
         topdir,
         ['ls-remote', '--heads', repository, 'staging', 'main', 'master'],
@@ -3099,6 +3113,8 @@ def update_all_tracking(
     series_list: Optional[List[Dict[str, Any]]] = None,
     progress_cb: Optional[Callable[[int, int, str], None]] = None,
     cancel_cb: Optional[Callable[[], bool]] = None,
+    upstream_repo: Optional[str] = None,
+    upstream_branch: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Rescan branches, then fetch threads and update all tracked series.
 
@@ -3152,10 +3168,11 @@ def update_all_tracking(
             ]
 
         upstream_commits: Optional[Dict[str, List[UpstreamCommit]]] = None
-        if topdir and series_list:
+        upstream_disabled = upstream_repo and upstream_repo.strip().lower() == 'none'
+        if topdir and series_list and not upstream_disabled:
             try:
-                repository = _resolve_upstream_repository(topdir)
-                branch = _resolve_upstream_branch(topdir, repository)
+                repository = _resolve_upstream_repository(topdir, upstream_repo)
+                branch = _resolve_upstream_branch(topdir, repository, upstream_branch)
                 oldest_sent = min(
                     datetime.date.fromisoformat(
                         str(series.get('sent_at') or '1970-01-01')[:10]
